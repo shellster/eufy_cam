@@ -1,0 +1,41 @@
+[eufy]
+# Eufy cloud account credentials.
+username = "email@example.com"
+password = "secret123"
+
+# Country and language for the Eufy API. Defaults: "US", "en"
+country = "US"
+language = "en"
+
+# Name shown in Eufy's trusted devices list. Cosmetic only, defaults to empty.
+trusted_device_name = ""
+
+# --- 2FA / Captcha (only needed if prompted during login) ---
+# verify_code = ""
+# captcha_id = ""
+# captcha_answer = ""
+
+[server]
+# Address to bind the HTTP server on. Default: "0.0.0.0"
+host = "0.0.0.0"
+# Port for the HTTP server. Default: 8080
+port = 8080
+# Enable verbose debug logging. Default: false
+# debug = true
+
+[p2p]
+# Local UDP port for P2P communication with stations/cameras.
+# 0 = OS picks a random ephemeral port. Default: 0
+# Set a specific port only if you need to configure firewall rules.
+local_port = 0
+
+# How to connect to the station. Default: 2
+#   1 = OnlyLocal  — only connect if station is on the same LAN
+#   2 = Quickest   — try LAN first, then fall back to cloud relay
+connection_type = 2
+
+[auth]
+# Optional HTTP auth for the server's API endpoints.
+# type = "digest"    # enables digest auth (omit to disable)
+# username = "admin"
+# password = "secret"

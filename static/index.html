@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Eufy Camera Viewer</title>
+	<style>
+		body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; background: #1a1a1a; color: #ffffff; }
+		h1 { margin: 20px 0; font-size: 24px; padding: 0 20px; }
+		.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; max-width: 1400px; margin: 0 auto; padding: 0 20px; }
+		.camera { background: #2d2d2d; border-radius: 12px; padding: 20px; transition: transform 0.2s; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+		.camera:hover { transform: translateY(-4px); box-shadow: 0 8px 12px rgba(0,0,0,0.15); }
+		.name { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+		.info { font-size: 14px; color: #888; margin-top: 4px; }
+		.loading { color: #4CAF50; padding: 20px; }
+		.status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
+		.status.online { background: #10B981; }
+		.status.offline { background: #6b7280; }
+		.btn { background: #2563eb; color: white; border: none; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; margin-top: 12px; }
+		.btn:hover { background: #1d4ed8; }
+		.btn:disabled { background: #6b7280; cursor: not-allowed; }
+		.btn.stop { background: #ef4444; }
+		.btn.stop:hover { background: #dc2626; }
+		.controls { margin-top: 20px; padding: 0 20px; }
+		#error { color: #ef4444; padding: 20px; background: #2d1f1f; border-radius: 8px; display: none; margin: 20px; }
+	</style>
+</head>
+<body>
+	<h1>Eufy Security Cameras</h1>
+
+	<div id="loading" class="loading">Connecting to stations...</div>
+	<div id="error"></div>
+	<div id="cameras" class="grid" style="display: none;"></div>
+	<div class="controls">
+		<button class="btn" onclick="loadCameras()">Refresh</button>
+	</div>
+
+	<script>
+		let cameras = [];
+		let stationsReady = false;
+		let pollTimer = null;
+
+		async function authFetch(url, options) {
+			const resp = await fetch(url, options);
+			if (resp.status === 401) {
+				window.location.reload();
+				return null;
+			}
+			return resp;
+		}
+
+		async function checkLogin() {
+			try {
+				const resp = await authFetch('/api/login/status');
+				if (!resp) return false;
+				const status = await resp.json();
+				if (!status.logged_in) {
+					window.location.href = '/login';
+					return false;
+				}
+				return true;
+			} catch (e) {
+				return false;
+			}
+		}
+
+		async function loadCameras() {
+			if (!await checkLogin()) return;
+			try {
+				document.getElementById('loading').style.display = 'block';
+				document.getElementById('error').style.display = 'none';
+
+				const resp = await authFetch('/api/cameras');
+				if (!resp) return;
+				cameras = await resp.json();
+
+				document.getElementById('loading').style.display = 'none';
+				renderCameras();
+			} catch (err) {
+				document.getElementById('loading').style.display = 'none';
+				showError(err.message);
+			}
+		}
+
+		async function checkStations() {
+			if (!await checkLogin()) return;
+			try {
+				const resp = await authFetch('/api/stations');
+				if (!resp) return;
+				const stations = await resp.json();
+
+				const anyConnected = stations && stations.some(s => s.connected);
+
+				if (anyConnected && !stationsReady) {
+					stationsReady = true;
+					if (pollTimer) {
+						clearInterval(pollTimer);
+						pollTimer = null;
+					}
+					loadCameras();
+				} else if (!stationsReady) {
+					document.getElementById('loading').textContent =
+						'Waiting for stations to connect... (retrying in 3s)';
+				}
+			} catch (err) {
+			}
+		}
+
+		function renderCameras() {
+			const grid = document.getElementById('cameras');
+			grid.innerHTML = '';
+
+			if (!cameras || cameras.length === 0) {
+				grid.innerHTML = '<div class="info">No cameras found</div>';
+				grid.style.display = 'block';
+				return;
+			}
+
+			cameras.forEach(camera => {
+				const card = document.createElement('div');
+				card.className = 'camera';
+
+				card.innerHTML = `
+					<div class="name">${camera.device_name}</div>
+					<div class="info">SN: ${camera.device_sn}</div>
+					<div class="info">Model: ${camera.model || 'Unknown'}</div>
+					<button class="btn" onclick="watchLive('${camera.device_sn}', ${camera.channel})">Watch Live</button>
+				`;
+
+				grid.appendChild(card);
+			});
+
+			grid.style.display = 'grid';
+		}
+
+		async function watchLive(deviceSN, channel) {
+			try {
+				const resp = await authFetch(`/api/stream/start/${deviceSN}?channel=${channel}`, { method: 'POST' });
+				if (!resp) return;
+				if (!resp.ok) {
+					const err = await resp.text();
+					showError(err);
+					return;
+				}
+				window.location.href = `/stream/${deviceSN}?deviceSN=${deviceSN}&channel=${channel}`;
+			} catch (err) {
+				showError(err.message);
+			}
+		}
+
+		function showError(message) {
+			const el = document.getElementById('error');
+			el.textContent = message;
+			el.style.display = 'block';
+			setTimeout(() => { el.style.display = 'none'; }, 8000);
+		}
+
+		checkLogin().then(loggedIn => {
+			if (loggedIn) {
+				pollTimer = setInterval(checkStations, 3000);
+				checkStations();
+			}
+		});
+	</script>
+</body>
+</html>

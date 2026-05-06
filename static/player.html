@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Camera Player</title>
+	<style>
+		body { margin: 0; background: #000; overflow: hidden; font-family: sans-serif; }
+		video { width: 100vw; height: 100vh; object-fit: contain; }
+		.overlay { position: fixed; top: 20px; left: 20px; background: rgba(0,0,0,0.7); padding: 10px 20px; border-radius: 8px; }
+		.overlay button { background: #fff; border: none; padding: 8px 16px; border-radius: 4px; font-weight: 600; cursor: pointer; margin-right: 8px; }
+		.overlay button:hover { background: #ddd; }
+		.stop-btn { background: #ef4444 !important; color: #fff !important; }
+		.stop-btn:hover { background: #dc2626 !important; }
+		.message { color: #fff; margin-bottom: 8px; font-size: 14px; }
+		.debug { color: #888; font-size: 11px; margin-top: 4px; }
+	</style>
+</head>
+<body>
+	<video id="video" autoplay playsinline muted></video>
+
+	<div class="overlay">
+		<div class="message" id="message">Connecting...</div>
+		<div class="debug" id="debug"></div>
+		<button onclick="window.location.href='/'">Back</button>
+		<button class="stop-btn" onclick="stopStream()">Stop</button>
+	</div>
+
+	<script src="/static/mpegts.min.js"></script>
+	<script>
+		const video = document.getElementById('video');
+		const msgEl = document.getElementById('message');
+		const dbgEl = document.getElementById('debug');
+		const params = new URLSearchParams(window.location.search);
+		const deviceSN = params.get('deviceSN') || window.location.pathname.split('/').pop();
+
+		let player = null;
+		let statusInterval = null;
+		let heartbeatWs = null;
+		let heartbeatInterval = null;
+
+		async function authFetch(url, options) {
+			const resp = await fetch(url, options);
+			if (resp.status === 401) {
+				window.location.reload();
+				return null;
+			}
+			return resp;
+		}
+
+		function dbg(msg) {
+			dbgEl.textContent = msg;
+		}
+
+		function startHeartbeat() {
+			const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+			heartbeatWs = new WebSocket(`${wsProto}//${location.host}/api/stream/ws/${deviceSN}`);
+
+			heartbeatWs.onopen = () => {
+				heartbeatInterval = setInterval(() => {
+					if (heartbeatWs && heartbeatWs.readyState === WebSocket.OPEN) {
+						heartbeatWs.send('ping');
+					}
+				}, 3000);
+			};
+
+			heartbeatWs.onclose = () => {
+				if (heartbeatInterval) {
+					clearInterval(heartbeatInterval);
+					heartbeatInterval = null;
+				}
+			};
+		}
+
+		async function pollStatus() {
+			try {
+				const resp = await authFetch(`/api/stream/status/${deviceSN}`);
+				if (!resp) return;
+				const status = await resp.json();
+				dbg(`stream=${status.active} frames=${status.frameCount} codec=${status.codec}`);
+			} catch (e) {}
+		}
+
+		async function startStream() {
+			try {
+				if (typeof mpegts === 'undefined') {
+					msgEl.textContent = 'Error: mpegts.js failed to load';
+					return;
+				}
+
+				if (!mpegts.isSupported()) {
+					msgEl.textContent = 'Error: MSE not supported in this browser';
+					return;
+				}
+
+				msgEl.textContent = 'Loading stream...';
+
+				player = mpegts.createPlayer({
+					type: 'mpegts',
+					isLive: true,
+					url: `/api/stream/${deviceSN}`
+				}, {
+					enableWorker: false,
+					enableStashBuffer: false,
+					autoCleanupSourceBuffer: true,
+					lazyLoad: false,
+					liveBufferLatencyChasing: true,
+					liveBufferLatencyChasingOnPaused: true,
+					autoCleanupMaxBackwardDuration: 3,
+					autoCleanupMinBackwardDuration: 2
+				});
+
+				player.attachMediaElement(video);
+
+				player.on(mpegts.Events.ERROR, (errorType, errorDetail, errorInfo) => {
+					msgEl.textContent = 'Player error: ' + errorDetail;
+					console.error('mpegts error:', errorType, errorDetail, errorInfo);
+				});
+
+				player.on(mpegts.Events.STATISTICS_INFO, (info) => {
+					dbg(`decoded=${info.decodedFrames || 0} speed=${info.speed || 0}x`);
+				});
+
+				player.on(mpegts.Events.LOADING_COMPLETE, () => {
+					msgEl.textContent = 'Stream ended';
+				});
+
+				player.load();
+				player.play().catch(() => {});
+
+				msgEl.textContent = 'Streaming';
+
+				startHeartbeat();
+
+				statusInterval = setInterval(pollStatus, 2000);
+				pollStatus();
+			} catch (err) {
+				msgEl.textContent = 'Error: ' + err.message;
+			}
+		}
+
+		async function stopStream() {
+			if (statusInterval) {
+				clearInterval(statusInterval);
+				statusInterval = null;
+			}
+			if (heartbeatInterval) {
+				clearInterval(heartbeatInterval);
+				heartbeatInterval = null;
+			}
+			if (heartbeatWs) {
+				heartbeatWs.close();
+				heartbeatWs = null;
+			}
+			if (player) {
+				player.pause();
+				player.unload();
+				player.detachMediaElement();
+				player.destroy();
+				player = null;
+			}
+			video.pause();
+			video.src = '';
+			msgEl.textContent = 'Stream stopped';
+			dbg('');
+
+			try {
+				await authFetch(`/api/stream/stop/${deviceSN}`, { method: 'POST' });
+			} catch (e) {}
+		}
+
+		window.addEventListener('beforeunload', () => {
+			if (heartbeatWs) {
+				heartbeatWs.close();
+			}
+		});
+
+		startStream();
+	</script>
+</body>
+</html>
