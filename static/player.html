@@ -93,6 +93,16 @@
 					return;
 				}
 
+				msgEl.textContent = 'Starting stream...';
+
+				const channel = params.get('channel') || '0';
+				const startResp = await authFetch(`/api/stream/start/${deviceSN}?channel=${channel}`, { method: 'POST' });
+				if (!startResp || !startResp.ok) {
+					const errText = startResp ? await startResp.text() : 'Authentication required';
+					msgEl.textContent = 'Failed to start stream: ' + errText;
+					return;
+				}
+
 				msgEl.textContent = 'Loading stream...';
 
 				player = mpegts.createPlayer({
@@ -168,12 +178,6 @@
 				await authFetch(`/api/stream/stop/${deviceSN}`, { method: 'POST' });
 			} catch (e) {}
 		}
-
-		window.addEventListener('beforeunload', () => {
-			if (heartbeatWs) {
-				heartbeatWs.close();
-			}
-		});
 
 		startStream();
 	</script>

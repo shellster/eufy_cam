@@ -33,10 +33,12 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 }
 
 // activeWatchers tracks WebSocket heartbeat connections per device.
-// When the last watcher disconnects, the livestream is stopped.
+// When the last watcher disconnects, a grace period timer starts
+// before the livestream is actually stopped.
 var (
 	activeWatchers   = make(map[string]int)
 	activeWatchersMu sync.Mutex
+	stopTimers       = make(map[string]*time.Timer)
 )
 
 type Server struct {
@@ -333,7 +335,15 @@ func (s *Server) StartStreamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stop any existing stream for this device first
+	// If a stream is already active for this device, reuse it
+	if strm := stream.GetStream(deviceSN); strm != nil && !strm.IsStale() {
+		debuglog.Debugf("Stream already active for %s, reusing existing session (id=%d)", deviceSN, strm.ID)
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, map[string]string{"status": "active", "device_sn": deviceSN})
+		return
+	}
+
+	// Stop any stale existing stream for this device first
 	s.stopLivestream(deviceSN)
 
 	stream.StartStream(deviceSN, station.GetSerial(), channel, int(p2p.VideoCodecH264))
@@ -395,6 +405,9 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 
 	var ptsMs uint64
 	frameCount := 0
+	lastFrameID := 0
+
+	var lastRestartCheck time.Time
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -405,7 +418,12 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 			if stream.GetStream(deviceSN) == nil {
 				return
 			}
-			frames := strm.GetFrames()
+			if time.Since(lastRestartCheck) > 10*time.Second && strm.IsStale() {
+				lastRestartCheck = time.Now()
+				go s.restartStaleStream(deviceSN)
+			}
+			frames, nextID := strm.GetFramesSince(lastFrameID)
+			lastFrameID = nextID
 			if len(frames) > 0 {
 				for _, frame := range frames {
 					if err := muxer.WriteFrame(frame, ptsMs); err != nil { return }
@@ -449,6 +467,11 @@ func (s *Server) StreamWebSocketHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	activeWatchersMu.Lock()
+	// Cancel any pending stop timer for this device
+	if timer, ok := stopTimers[deviceSN]; ok {
+		timer.Stop()
+		delete(stopTimers, deviceSN)
+	}
 	activeWatchers[deviceSN]++
 	count := activeWatchers[deviceSN]
 	activeWatchersMu.Unlock()
@@ -464,17 +487,25 @@ func (s *Server) StreamWebSocketHandler(w http.ResponseWriter, r *http.Request) 
 		activeWatchersMu.Unlock()
 
 		if remaining <= 0 {
-			// Only stop if the stream hasn't been replaced by a new one
-			stopped := stream.StopStreamIfID(deviceSN, streamID)
-			if stopped {
-				debuglog.Debugf("StreamWebSocket: last watcher gone for %s, stopping livestream (streamID=%d)", deviceSN, streamID)
-				station := devices.GetStation(stationSN)
-				if station != nil {
-					_ = station.StopLivestream(deviceSN, channel)
+			// Schedule stream stop after grace period instead of immediately
+			activeWatchersMu.Lock()
+			stopTimers[deviceSN] = time.AfterFunc(30*time.Second, func() {
+				activeWatchersMu.Lock()
+				delete(stopTimers, deviceSN)
+				activeWatchersMu.Unlock()
+
+				// Only stop if the stream hasn't been replaced by a new one
+				stopped := stream.StopStreamIfID(deviceSN, streamID)
+				if stopped {
+					debuglog.Debugf("StreamWebSocket: grace period expired for %s, stopping livestream (streamID=%d)", deviceSN, streamID)
+					station := devices.GetStation(stationSN)
+					if station != nil {
+						_ = station.StopLivestream(deviceSN, channel)
+					}
 				}
-			} else {
-				debuglog.Debugf("StreamWebSocket: last watcher gone for %s but stream was replaced, skipping stop", deviceSN)
-			}
+			})
+			activeWatchersMu.Unlock()
+			debuglog.Debugf("StreamWebSocket: last watcher gone for %s, scheduled stop in 30s", deviceSN)
 		} else {
 			debuglog.Debugf("StreamWebSocket: watcher disconnected for %s (remaining: %d)", deviceSN, remaining)
 		}
@@ -542,6 +573,30 @@ func (s *Server) onVideoFrame(deviceSN string, frameData []byte, metadata p2p.Vi
 		debuglog.Debugf("onVideoFrame: %s frame #%d buffered, %d bytes, keyFrame=%v", deviceSN, session.FrameCount(), len(frameData), metadata.IsKeyFrame)
 	}
 	return nil
+}
+
+func (s *Server) restartStaleStream(deviceSN string) {
+	strm := stream.GetStream(deviceSN)
+	if strm == nil {
+		return
+	}
+	if !strm.IsStale() {
+		return
+	}
+
+	station := devices.GetStation(strm.Station)
+	if station == nil || !station.IsConnected() {
+		return
+	}
+
+	debuglog.Debugf("Restarting stale livestream for %s", deviceSN)
+	_ = station.StopLivestream(deviceSN, strm.Channel)
+	strm.ResetLastUpdate()
+	strm.ClearBuffer()
+
+	if err := station.StartLivestream(deviceSN, strm.Channel, strm.Codec, s.onVideoFrame); err != nil {
+		debuglog.Debugf("Failed to restart livestream for %s: %v", deviceSN, err)
+	}
 }
 
 func (s *Server) stopLivestream(deviceSN string) {

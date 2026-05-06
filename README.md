@@ -80,6 +80,12 @@ You can of course pipe this to ffmpeg and do anything you want with it.
 ./eufy-cli -user admin -pass secret -server http://localhost:8080 list
 ```
 
+## Streaming
+
+**One stream per device (hub limitation):** Eufy stations/homebases only support one active P2P stream per device at a time — this is a firmware/hardware limitation, not a server restriction. If a stream is already running for a device, new requests reuse the existing session rather than starting a new one. You cannot stream different channels of the same camera simultaneously.
+
+**Multiple clients, same camera:** Multiple clients can connect to and view the same camera stream concurrently. The server maintains a shared frame buffer — all connected clients receive the same frames without creating additional P2P connections. The stream stays alive as long as at least one client is connected (with a 30-second grace period after the last disconnect).
+
 ## Architecture
 
 ```
@@ -106,6 +112,12 @@ Implements Eufy's proprietary P2P protocol over UDP. Supports LEVEL_1 and LEVEL_
 ## Why?
 
 Because existing tools had subtle bugs and were written in NodeJS which made them difficult to port, memory hogs, and something I didn't want to debug.
+
+## Version
+
+- 1.0.0 May 5th 2026:  Initial Release
+
+- 1.0.1 May 6th 2026:  Support multiple client streams from the same camera and stale stream automatic restart
 
 ## Credit
 

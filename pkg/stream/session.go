@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"sort"
 	"time"
 
 	"github.com/shellster/eufy_cam/pkg/p2p"
@@ -8,6 +9,18 @@ import (
 
 const maxFrames = 100
 const maxBufferBytes = 4 * 1024 * 1024 // 4MB
+const StaleThreshold = 5 * time.Second
+
+func (s *StreamSession) IsStale() bool {
+	if s.LastUpdate == 0 {
+		return false
+	}
+	return time.Since(time.UnixMilli(s.LastUpdate)) > StaleThreshold
+}
+
+func (s *StreamSession) ResetLastUpdate() {
+	s.LastUpdate = time.Now().UnixMilli()
+}
 
 func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMetadata) {
 	s.mu.Lock()
@@ -19,40 +32,84 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 		s.Codec = 2
 	}
 
+	s.NextFrameID++
 	s.FrameBuffer = append(s.FrameBuffer, frameData)
+	s.frameIDs = append(s.frameIDs, s.NextFrameID)
+
+	if metadata.IsKeyFrame {
+		s.lastKeyFrameIdx = len(s.FrameBuffer) - 1
+	}
 
 	// Drop oldest frames if buffer exceeds size limit
+	dropped := 0
 	var totalBytes int
 	for i := len(s.FrameBuffer) - 1; i >= 0; i-- {
 		totalBytes += len(s.FrameBuffer[i])
 		if totalBytes > maxBufferBytes {
-			s.FrameBuffer = s.FrameBuffer[i+1:]
+			dropped = i + 1
 			break
+		}
+	}
+	if dropped > 0 {
+		s.FrameBuffer = s.FrameBuffer[dropped:]
+		s.frameIDs = s.frameIDs[dropped:]
+		s.lastKeyFrameIdx -= dropped
+		if s.lastKeyFrameIdx < 0 {
+			s.lastKeyFrameIdx = 0
 		}
 	}
 
 	if len(s.FrameBuffer) > maxFrames {
-		s.FrameBuffer = s.FrameBuffer[len(s.FrameBuffer)-maxFrames:]
+		dropCount := len(s.FrameBuffer) - maxFrames
+		s.FrameBuffer = s.FrameBuffer[dropCount:]
+		s.frameIDs = s.frameIDs[dropCount:]
+		s.lastKeyFrameIdx -= dropCount
+		if s.lastKeyFrameIdx < 0 {
+			s.lastKeyFrameIdx = 0
+		}
 	}
 }
 
-func (s *StreamSession) GetFrames() [][]byte {
+// GetFramesSince returns all frames after sinceID. If sinceID is before the
+// last keyframe, frames start from the keyframe so the client can resync.
+// Returns the frames and the nextID to pass on the next call.
+func (s *StreamSession) GetFramesSince(sinceID int) ([][]byte, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(s.FrameBuffer) == 0 {
-		return nil
+		return nil, sinceID
 	}
 
-	frames := s.FrameBuffer
-	s.FrameBuffer = s.FrameBuffer[:0]
-	return frames
+	// Find where to start reading
+	startIdx := 0
+	if sinceID > 0 {
+		idx := sort.SearchInts(s.frameIDs, sinceID+1)
+		// If client is too far behind, resync from last keyframe
+		if idx < s.lastKeyFrameIdx {
+			idx = s.lastKeyFrameIdx
+		}
+		startIdx = idx
+	} else {
+		// New client — start from last keyframe
+		startIdx = s.lastKeyFrameIdx
+	}
+
+	if startIdx >= len(s.FrameBuffer) {
+		return nil, s.NextFrameID
+	}
+
+	frames := make([][]byte, len(s.FrameBuffer)-startIdx)
+	copy(frames, s.FrameBuffer[startIdx:])
+	return frames, s.NextFrameID
 }
 
 func (s *StreamSession) ClearBuffer() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.FrameBuffer = make([][]byte, 0)
+	s.FrameBuffer = s.FrameBuffer[:0]
+	s.frameIDs = s.frameIDs[:0]
+	s.lastKeyFrameIdx = 0
 }
 
 func (s *StreamSession) IsActive() bool {

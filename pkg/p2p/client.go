@@ -73,8 +73,8 @@ type Client struct {
 
 	seqNumber       uint16
 	expectedSeqNo   [4]uint16
-	videoCallbacks   map[string]StreamCallback
-	channelToDevice  map[byte]string
+	videoRoutes     map[byte]*videoRoute
+	videoStates     map[byte]*VideoFrameState
 
 	encryption     EncryptionType
 	p2pKey         []byte
@@ -96,6 +96,11 @@ type Client struct {
 }
 
 type StreamCallback func(deviceSN string, frameData []byte, metadata VideoFrameMetadata) error
+
+type videoRoute struct {
+	deviceSN string
+	callback StreamCallback
+}
 
 type APICipherGetter interface {
 	GetCipher(cipherID int, userID string) (*api.Cipher, error)
@@ -119,11 +124,13 @@ type MessageStateTracker struct {
 	leftoverData        []byte
 	queuedData          map[int]*P2PMessage
 	videoCodec          VideoCodec
-	// Video frame reassembly
-	videoFrameBuf       []byte
-	videoBytesToRead    int
-	videoBytesRead      int
-	videoHeader         P2PDataHeader
+}
+
+type VideoFrameState struct {
+	frameBuf    []byte
+	bytesToRead int
+	bytesRead   int
+	header      P2PDataHeader
 }
 
 type P2PMessage struct {
@@ -158,8 +165,8 @@ func NewClient(station *api.Station, dskKey string, apiClient APICipherGetter) *
 		encryption:      EncryptionTypeNone,
 		encryptionReady: make(chan struct{}),
 		connectedReady:  make(chan struct{}),
-		videoCallbacks:  make(map[string]StreamCallback),
-		channelToDevice: make(map[byte]string),
+		videoRoutes:     make(map[byte]*videoRoute),
+		videoStates:     make(map[byte]*VideoFrameState),
 		messageStates:   make(map[uint16]*MessageState),
 		turnHandshaking: make(map[string]bool),
 	}
@@ -695,20 +702,38 @@ func (c *Client) handleDataMessage(payload []byte, raddr *net.UDPAddr) {
 		return
 	}
 
-	c.mu.Lock()
-	expectedSeq := c.expectedSeqNo[dtIdx]
-	c.mu.Unlock()
-
-	if seqNo == expectedSeq {
+	if dataType == DataTypeVIDEO {
 		c.mu.Lock()
-		c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
+		expectedSeq := c.expectedSeqNo[dtIdx]
 		c.mu.Unlock()
 
-		// VIDEO data: reassemble multi-packet frames, then process.
-		if dataType == DataTypeVIDEO {
-			ms := c.msgState[dtIdx]
+		if seqNo == expectedSeq {
+			c.mu.Lock()
+			c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
+			c.mu.Unlock()
+
+			// First packet of a frame has MagicWord header with channel info.
+			// Continuation packets have no header — use the channel from the first packet.
+			var ch byte
 			if len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord {
-				// First packet of a video frame
+				ch = data[12]
+			} else {
+				// Find which channel is mid-assembly
+				for c, vs := range c.videoStates {
+					if vs.bytesToRead > 0 {
+						ch = c
+						break
+					}
+				}
+			}
+
+			vs := c.videoStates[ch]
+			if vs == nil {
+				vs = &VideoFrameState{}
+				c.videoStates[ch] = vs
+			}
+
+			if len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord {
 				header := P2PDataHeader{}
 				header.commandID = binary.LittleEndian.Uint16(data[4:6])
 				header.bytesToRead = int(binary.LittleEndian.Uint32(data[6:10]))
@@ -716,23 +741,32 @@ func (c *Client) handleDataMessage(payload []byte, raddr *net.UDPAddr) {
 				header.signCode = data[13]
 				header.dataType = data[14]
 				videoData := data[P2PDataHeaderBytes:]
-				ms.videoHeader = header
-				ms.videoBytesToRead = header.bytesToRead
-				ms.videoBytesRead = len(videoData)
-				ms.videoFrameBuf = make([]byte, len(videoData))
-				copy(ms.videoFrameBuf, videoData)
-			} else if ms.videoBytesToRead > 0 {
-				// Continuation packet
-				ms.videoFrameBuf = append(ms.videoFrameBuf, data...)
-				ms.videoBytesRead += len(data)
+				vs.header = header
+				vs.bytesToRead = header.bytesToRead
+				vs.bytesRead = len(videoData)
+				vs.frameBuf = make([]byte, len(videoData))
+				copy(vs.frameBuf, videoData)
+			} else if vs.bytesToRead > 0 {
+				vs.frameBuf = append(vs.frameBuf, data...)
+				vs.bytesRead += len(data)
 			}
-			if ms.videoBytesToRead > 0 && ms.videoBytesRead >= ms.videoBytesToRead {
-				c.handleVideoData(seqNo, ms.videoHeader, ms.videoFrameBuf)
-				ms.videoFrameBuf = nil
-				ms.videoBytesToRead = 0
-				ms.videoBytesRead = 0
+			if vs.bytesToRead > 0 && vs.bytesRead >= vs.bytesToRead {
+				c.handleVideoData(seqNo, vs.header, vs.frameBuf)
+				vs.frameBuf = nil
+				vs.bytesToRead = 0
+				vs.bytesRead = 0
 			}
-		} else {
+		}
+	} else {
+		c.mu.Lock()
+		expectedSeq := c.expectedSeqNo[dtIdx]
+		c.mu.Unlock()
+
+		if seqNo == expectedSeq {
+			c.mu.Lock()
+			c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
+			c.mu.Unlock()
+
 			msg := &P2PMessage{
 				dataType:   dataType,
 				seqNo:      seqNo,
@@ -755,13 +789,13 @@ func (c *Client) handleDataMessage(payload []byte, raddr *net.UDPAddr) {
 				c.parseDataMessage(queued)
 				delete(ms.queuedData, int(nextSeq))
 			}
-		}
-	} else {
-		ms := c.msgState[dtIdx]
-		ms.queuedData[int(seqNo)] = &P2PMessage{
-			dataType:   dataType,
-			seqNo:      seqNo,
-			data:       data,
+		} else {
+			ms := c.msgState[dtIdx]
+			ms.queuedData[int(seqNo)] = &P2PMessage{
+				dataType:   dataType,
+				seqNo:      seqNo,
+				data:       data,
+			}
 		}
 	}
 }
@@ -933,10 +967,15 @@ func (c *Client) handleCompleteData(header P2PDataHeader, seqNo uint16, dataType
 func (c *Client) handleVideoData(seqNo uint16, header P2PDataHeader, data []byte) {
 	c.mu.Lock()
 	rsaKey := c.rsaKey
-	// Look up which device SN this channel maps to
-	deviceSN := c.channelToDevice[header.channel]
-	cb := c.videoCallbacks[deviceSN]
+	route := c.videoRoutes[header.channel]
 	c.mu.Unlock()
+
+	var deviceSN string
+	var cb StreamCallback
+	if route != nil {
+		deviceSN = route.deviceSN
+		cb = route.callback
+	}
 
 	if CommandType(header.commandID) == CMD_VIDEO_FRAME {
 		metadata, frameData, err := ParseVideoFrameWithDecryption(data, rsaKey, header.signCode)
@@ -1273,32 +1312,28 @@ func (c *Client) handleSetPayloadResponse(data []byte) {
 func (c *Client) SetVideoCallback(deviceSN string, channel byte, callback StreamCallback) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.videoCallbacks[deviceSN] = callback
-	c.channelToDevice[channel] = deviceSN
+	if existing, ok := c.videoRoutes[channel]; ok && existing.deviceSN != deviceSN {
+		debuglog.Debugf("P2P: channel %d collision: replacing %s with %s", channel, existing.deviceSN, deviceSN)
+	}
+	c.videoRoutes[channel] = &videoRoute{deviceSN: deviceSN, callback: callback}
 }
 
 func (c *Client) ClearVideoCallback() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.videoCallbacks = make(map[string]StreamCallback)
-	c.channelToDevice = make(map[byte]string)
+	c.videoRoutes = make(map[byte]*videoRoute)
 }
 
 func (c *Client) ClearVideoCallbackForDevice(deviceSN string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.videoCallbacks, deviceSN)
-	for ch, sn := range c.channelToDevice {
-		if sn == deviceSN {
-			delete(c.channelToDevice, ch)
+	for ch, route := range c.videoRoutes {
+		if route.deviceSN == deviceSN {
+			delete(c.videoRoutes, ch)
+			delete(c.videoStates, ch)
 		}
 	}
-	// Reset video accumulator state so next stream starts fresh
-	ms := c.msgState[DataTypeVIDEO]
-	ms.videoFrameBuf = nil
-	ms.videoBytesToRead = 0
-	ms.videoBytesRead = 0
-	ms.videoCodec = VideoCodecUnknown
+	c.msgState[DataTypeVIDEO].videoCodec = VideoCodecUnknown
 }
 
 func (c *Client) handleTurnServerOK(payload []byte, raddr *net.UDPAddr) {

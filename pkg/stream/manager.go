@@ -8,16 +8,19 @@ import (
 )
 
 type StreamSession struct {
-	ID          int64
-	DeviceSN    string
-	Station     string
-	Channel     int
-	Codec       int
-	IsMuxed     bool
-	FrameBuffer [][]byte
-	StartedAt   int64
-	LastUpdate  int64
-	mu          sync.Mutex
+	ID              int64
+	DeviceSN        string
+	Station         string
+	Channel         int
+	Codec           int
+	IsMuxed         bool
+	FrameBuffer     [][]byte
+	frameIDs        []int
+	NextFrameID     int
+	lastKeyFrameIdx int
+	StartedAt       int64
+	LastUpdate      int64
+	mu              sync.Mutex
 }
 
 var (
