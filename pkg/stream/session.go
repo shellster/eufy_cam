@@ -4,6 +4,7 @@ import (
 	"sort"
 	"time"
 
+	debuglog "github.com/shellster/eufy_cam/pkg/log"
 	"github.com/shellster/eufy_cam/pkg/p2p"
 )
 
@@ -28,8 +29,18 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 
 	s.LastUpdate = time.Now().UnixMilli()
 
-	if metadata.StreamType == 2 && s.Codec != 2 {
-		s.Codec = 2
+	if s.Codec == 0 {
+		detected := p2p.GetVideoCodec(frameData)
+		if detected == p2p.VideoCodecH265 {
+			s.Codec = 2
+		} else if detected == p2p.VideoCodecH264 {
+			s.Codec = 1
+		} else if metadata.StreamType == 2 {
+			s.Codec = 2
+		}
+		if s.Codec != 0 {
+			debuglog.Debugf("StreamSession: detected codec %d for %s", s.Codec, s.DeviceSN)
+		}
 	}
 
 	s.NextFrameID++

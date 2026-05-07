@@ -10,20 +10,19 @@
 		.overlay { position: fixed; top: 20px; left: 20px; background: rgba(0,0,0,0.7); padding: 10px 20px; border-radius: 8px; }
 		.overlay button { background: #fff; border: none; padding: 8px 16px; border-radius: 4px; font-weight: 600; cursor: pointer; margin-right: 8px; }
 		.overlay button:hover { background: #ddd; }
-		.stop-btn { background: #ef4444 !important; color: #fff !important; }
-		.stop-btn:hover { background: #dc2626 !important; }
 		.message { color: #fff; margin-bottom: 8px; font-size: 14px; }
 		.debug { color: #888; font-size: 11px; margin-top: 4px; }
+		.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
+		@keyframes spin { to { transform: rotate(360deg); } }
 	</style>
 </head>
 <body>
 	<video id="video" autoplay playsinline muted></video>
 
 	<div class="overlay">
-		<div class="message" id="message">Connecting...</div>
+		<div class="message" id="message"><span class="spinner"></span>Connecting...</div>
 		<div class="debug" id="debug"></div>
 		<button onclick="window.location.href='/'">Back</button>
-		<button class="stop-btn" onclick="stopStream()">Stop</button>
 	</div>
 
 	<script src="/static/mpegts.min.js"></script>
@@ -93,7 +92,7 @@
 					return;
 				}
 
-				msgEl.textContent = 'Starting stream...';
+				msgEl.innerHTML = '<span class="spinner"></span>Establishing P2P connection...';
 
 				const channel = params.get('channel') || '0';
 				const startResp = await authFetch(`/api/stream/start/${deviceSN}?channel=${channel}`, { method: 'POST' });
@@ -103,7 +102,7 @@
 					return;
 				}
 
-				msgEl.textContent = 'Loading stream...';
+				msgEl.innerHTML = '<span class="spinner"></span>Loading video stream...';
 
 				player = mpegts.createPlayer({
 					type: 'mpegts',
@@ -136,9 +135,10 @@
 				});
 
 				player.load();
+				video.addEventListener('playing', () => { msgEl.textContent = ''; }, { once: true });
 				player.play().catch(() => {});
 
-				msgEl.textContent = 'Streaming';
+				msgEl.innerHTML = '<span class="spinner"></span>Buffering...';
 
 				startHeartbeat();
 
@@ -149,35 +149,6 @@
 			}
 		}
 
-		async function stopStream() {
-			if (statusInterval) {
-				clearInterval(statusInterval);
-				statusInterval = null;
-			}
-			if (heartbeatInterval) {
-				clearInterval(heartbeatInterval);
-				heartbeatInterval = null;
-			}
-			if (heartbeatWs) {
-				heartbeatWs.close();
-				heartbeatWs = null;
-			}
-			if (player) {
-				player.pause();
-				player.unload();
-				player.detachMediaElement();
-				player.destroy();
-				player = null;
-			}
-			video.pause();
-			video.src = '';
-			msgEl.textContent = 'Stream stopped';
-			dbg('');
-
-			try {
-				await authFetch(`/api/stream/stop/${deviceSN}`, { method: 'POST' });
-			} catch (e) {}
-		}
 
 		startStream();
 	</script>

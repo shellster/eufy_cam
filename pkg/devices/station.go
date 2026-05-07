@@ -14,11 +14,13 @@ import (
 )
 
 type Station struct {
-	apiStation *api.Station
-	p2pClient  *p2p.Client
-	rsaKey     *rsa.PrivateKey
-	apiClient  *api.Client
-	mu         sync.Mutex
+	apiStation    *api.Station
+	p2pClient     *p2p.Client
+	rsaKey        *rsa.PrivateKey
+	apiClient     *api.Client
+	dskKey        string
+	streamClients map[string]*p2p.Client
+	mu            sync.Mutex
 }
 
 var (
@@ -28,8 +30,9 @@ var (
 
 func NewStation(apiStation *api.Station) (*Station, error) {
 	return &Station{
-		apiStation: apiStation,
-		p2pClient:  nil,
+		apiStation:    apiStation,
+		p2pClient:     nil,
+		streamClients: make(map[string]*p2p.Client),
 	}, nil
 }
 
@@ -46,6 +49,7 @@ func (s *Station) ConnectWithAPI(dskKey string, apiClient *api.Client) error {
 	}
 
 	s.apiClient = apiClient
+	s.dskKey = dskKey
 
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -81,6 +85,12 @@ func (s *Station) Disconnect() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	for deviceSN, sc := range s.streamClients {
+		debuglog.Debugf("Station %s: closing stream connection for %s", s.GetSerial(), deviceSN)
+		_ = sc.Close()
+	}
+	s.streamClients = make(map[string]*p2p.Client)
+
 	if s.p2pClient == nil {
 		return nil
 	}
@@ -95,20 +105,65 @@ func (s *Station) IsConnected() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.p2pClient != nil && s.p2pClient.IsConnected()
+	if s.p2pClient != nil && s.p2pClient.IsConnected() {
+		return true
+	}
+	for _, sc := range s.streamClients {
+		if sc.IsConnected() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, callback p2p.StreamCallback) error {
-	if s.p2pClient == nil {
-		return fmt.Errorf("not connected to station")
+	s.mu.Lock()
+	dskKey := s.dskKey
+	apiClient := s.apiClient
+
+	// Close existing stream connection for this camera
+	if sc, ok := s.streamClients[deviceSN]; ok {
+		debuglog.Debugf("StartLivestream: closing existing stream connection for %s", deviceSN)
+		_ = sc.Close()
+		delete(s.streamClients, deviceSN)
+	}
+	s.mu.Unlock()
+
+	// Create dedicated P2P connection for this camera's stream
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("failed to generate RSA key: %w", err)
 	}
 
-	s.p2pClient.SetVideoCallback(deviceSN, byte(channel), callback)
+	streamClient := p2p.NewClient(s.apiStation, dskKey, apiClient)
+	streamClient.SetRSAKey(rsaKey)
 
-	// Export RSA public key modulus, strip leading byte (matching Node.js: n.subarray(1).toString("hex"))
+	debuglog.Debugf("StartLivestream: connecting dedicated P2P for %s on channel %d", deviceSN, channel)
+
+	if err := streamClient.Connect(); err != nil {
+		return fmt.Errorf("stream connect failed for %s: %w", deviceSN, err)
+	}
+
+	if !streamClient.WaitForConnection(30 * time.Second) {
+		return fmt.Errorf("stream connection timeout for %s", deviceSN)
+	}
+	debuglog.Debugf("StartLivestream: P2P connected for %s, waiting for encryption", deviceSN)
+
+	if !streamClient.WaitForEncryption(15 * time.Second) {
+		return fmt.Errorf("stream encryption timeout for %s", deviceSN)
+	}
+	debuglog.Debugf("StartLivestream: encryption ready for %s", deviceSN)
+
+	streamClient.SetVideoCallback(deviceSN, byte(channel), callback)
+
+	s.mu.Lock()
+	s.streamClients[deviceSN] = streamClient
+	s.mu.Unlock()
+
+	// Export RSA public key modulus, strip leading byte
 	rsaPubKeyHex := ""
-	if s.rsaKey != nil {
-		n := s.rsaKey.N.Bytes()
+	if rsaKey != nil {
+		n := rsaKey.N.Bytes()
 		if len(n) > 1 {
 			rsaPubKeyHex = fmt.Sprintf("%x", n[1:])
 		}
@@ -120,11 +175,11 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 		"mChannel":   channel,
 		"mValue3":    int(p2p.CMD_START_REALTIME_MEDIA),
 		"payload": map[string]interface{}{
-			"ClientOS":     "Android",
+			"ClientOS":    "Android",
 			"camera_type": 0,
-			"entrytype":    0,
-			"key":          rsaPubKeyHex,
-			"streamtype":   1,
+			"entrytype":   0,
+			"key":         rsaPubKeyHex,
+			"streamtype":  1,
 		},
 	}
 
@@ -133,24 +188,27 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	debuglog.Debugf("StartLivestream: account_id=%s channel=%d json=%s", s.apiStation.Member.AdminUserID, channel, string(payloadJSON))
+	debuglog.Debugf("StartLivestream: account_id=%s channel=%d device=%s", s.apiStation.Member.AdminUserID, channel, deviceSN)
 
-	return s.p2pClient.SendCommandWithStringPayload(p2p.CMD_SET_PAYLOAD, byte(channel), string(payloadJSON))
+	return streamClient.SendCommandWithStringPayload(p2p.CMD_SET_PAYLOAD, byte(channel), string(payloadJSON))
 }
 
 func (s *Station) StopLivestream(deviceSN string, channel int) error {
-	if s.p2pClient == nil || !s.p2pClient.IsConnected() {
-		return fmt.Errorf("not connected to station")
+	s.mu.Lock()
+	sc, ok := s.streamClients[deviceSN]
+	if ok {
+		delete(s.streamClients, deviceSN)
+	}
+	s.mu.Unlock()
+
+	if !ok {
+		debuglog.Debugf("StopLivestream: no stream connection for %s", deviceSN)
+		return nil
 	}
 
-	s.p2pClient.ClearVideoCallbackForDevice(deviceSN)
-
-	err := s.p2pClient.SendCommandWithInt(p2p.CMD_STOP_REALTIME_MEDIA, byte(channel), uint32(channel))
-	if err != nil {
-		return fmt.Errorf("failed to send stop livestream: %w", err)
-	}
-
-	return nil
+	debuglog.Debugf("StopLivestream: closing stream connection for %s", deviceSN)
+	_ = sc.SendCommandWithInt(p2p.CMD_STOP_REALTIME_MEDIA, byte(channel), uint32(channel))
+	return sc.Close()
 }
 
 func (s *Station) GetSerial() string {
@@ -167,8 +225,9 @@ func AddOrUpdateStation(apiStation *api.Station) *Station {
 	}
 
 	station := &Station{
-		apiStation: apiStation,
-		p2pClient:  nil,
+		apiStation:    apiStation,
+		p2pClient:     nil,
+		streamClients: make(map[string]*p2p.Client),
 	}
 
 	activeStations[apiStation.StationSN] = station
