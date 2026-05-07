@@ -73,8 +73,10 @@ type Client struct {
 
 	seqNumber       uint16
 	expectedSeqNo   [4]uint16
-	videoRoutes     map[byte]*videoRoute
-	videoStates     map[byte]*VideoFrameState
+	videoRoutes      map[byte]*videoRoute
+	videoStates      map[byte]*VideoFrameState
+	lastVideoChannel byte
+	lastVideoPacketTime time.Time
 
 	encryption     EncryptionType
 	p2pKey         []byte
@@ -121,9 +123,8 @@ type P2PDataHeader struct {
 }
 
 type MessageStateTracker struct {
-	leftoverData        []byte
-	queuedData          map[int]*P2PMessage
-	videoCodec          VideoCodec
+	leftoverData []byte
+	queuedData   map[int]*P2PMessage
 }
 
 type VideoFrameState struct {
@@ -711,50 +712,67 @@ func (c *Client) handleDataMessage(payload []byte, raddr *net.UDPAddr) {
 			c.mu.Lock()
 			c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
 			c.mu.Unlock()
+			c.lastVideoPacketTime = time.Now()
 
-			// First packet of a frame has MagicWord header with channel info.
-			// Continuation packets have no header — use the channel from the first packet.
-			var ch byte
-			if len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord {
-				ch = data[12]
-			} else {
-				// Find which channel is mid-assembly
-				for c, vs := range c.videoStates {
-					if vs.bytesToRead > 0 {
-						ch = c
-						break
-					}
+			c.processVideoPacket(seqNo, data)
+
+			// Drain queued video packets
+			ms := c.msgState[dtIdx]
+			for {
+				c.mu.Lock()
+				nextSeq := c.expectedSeqNo[dtIdx]
+				c.mu.Unlock()
+				queued, ok := ms.queuedData[int(nextSeq)]
+				if !ok {
+					break
 				}
+				c.mu.Lock()
+				c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
+				c.mu.Unlock()
+				c.processVideoPacket(queued.seqNo, queued.data)
+				delete(ms.queuedData, int(nextSeq))
+			}
+		} else {
+			ms := c.msgState[dtIdx]
+			ms.queuedData[int(seqNo)] = &P2PMessage{
+				dataType: dataType,
+				seqNo:    seqNo,
+				data:     data,
 			}
 
-			vs := c.videoStates[ch]
-			if vs == nil {
-				vs = &VideoFrameState{}
-				c.videoStates[ch] = vs
-			}
-
-			if len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord {
-				header := P2PDataHeader{}
-				header.commandID = binary.LittleEndian.Uint16(data[4:6])
-				header.bytesToRead = int(binary.LittleEndian.Uint32(data[6:10]))
-				header.channel = data[12]
-				header.signCode = data[13]
-				header.dataType = data[14]
-				videoData := data[P2PDataHeaderBytes:]
-				vs.header = header
-				vs.bytesToRead = header.bytesToRead
-				vs.bytesRead = len(videoData)
-				vs.frameBuf = make([]byte, len(videoData))
-				copy(vs.frameBuf, videoData)
-			} else if vs.bytesToRead > 0 {
-				vs.frameBuf = append(vs.frameBuf, data...)
-				vs.bytesRead += len(data)
-			}
-			if vs.bytesToRead > 0 && vs.bytesRead >= vs.bytesToRead {
-				c.handleVideoData(seqNo, vs.header, vs.frameBuf)
-				vs.frameBuf = nil
-				vs.bytesToRead = 0
-				vs.bytesRead = 0
+			// Inline resync: if stuck for >2s, process queued packets directly
+			if !c.lastVideoPacketTime.IsZero() && time.Since(c.lastVideoPacketTime) > 2*time.Second {
+				for {
+					c.mu.Lock()
+					nextSeq := c.expectedSeqNo[dtIdx]
+					c.mu.Unlock()
+					queued, ok := ms.queuedData[int(nextSeq)]
+					if !ok {
+						if len(ms.queuedData) == 0 {
+							break
+						}
+						// Gap: skip to lowest queued seq
+						var lowest uint16
+						first := true
+						for k := range ms.queuedData {
+							s := uint16(k)
+							if first || isSeqBefore(s, lowest) {
+								lowest = s
+								first = false
+							}
+						}
+						c.mu.Lock()
+						c.expectedSeqNo[dtIdx] = lowest
+						c.mu.Unlock()
+						continue
+					}
+					c.mu.Lock()
+					c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
+					c.mu.Unlock()
+					c.lastVideoPacketTime = time.Now()
+					c.processVideoPacket(queued.seqNo, queued.data)
+					delete(ms.queuedData, int(nextSeq))
+				}
 			}
 		}
 	} else {
@@ -798,6 +816,58 @@ func (c *Client) handleDataMessage(payload []byte, raddr *net.UDPAddr) {
 			}
 		}
 	}
+}
+
+func (c *Client) processVideoPacket(seqNo uint16, data []byte) {
+	var ch byte
+	if len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord {
+		ch = data[12]
+		c.lastVideoChannel = ch
+	} else {
+		ch = c.lastVideoChannel
+	}
+
+	vs := c.videoStates[ch]
+	if vs == nil {
+		vs = &VideoFrameState{}
+		c.videoStates[ch] = vs
+	}
+
+	if len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord {
+		header := P2PDataHeader{}
+		header.commandID = binary.LittleEndian.Uint16(data[4:6])
+		header.bytesToRead = int(binary.LittleEndian.Uint32(data[6:10]))
+		header.channel = data[12]
+		header.signCode = data[13]
+		header.dataType = data[14]
+		videoData := data[P2PDataHeaderBytes:]
+		vs.header = header
+		vs.bytesToRead = header.bytesToRead
+		vs.bytesRead = len(videoData)
+		vs.frameBuf = make([]byte, len(videoData))
+		copy(vs.frameBuf, videoData)
+	} else if vs.bytesToRead > 0 {
+		vs.frameBuf = append(vs.frameBuf, data...)
+		vs.bytesRead += len(data)
+	}
+	if vs.bytesToRead > 0 && vs.bytesRead >= vs.bytesToRead {
+		c.handleVideoData(seqNo, vs.header, vs.frameBuf)
+		vs.frameBuf = nil
+		vs.bytesToRead = 0
+		vs.bytesRead = 0
+	}
+}
+
+
+func isSeqBefore(a, b uint16) bool {
+	diff := int(a) - int(b)
+	if diff > MaxSequenceNumber/2 {
+		diff -= MaxSequenceNumber
+	}
+	if diff < -MaxSequenceNumber/2 {
+		diff += MaxSequenceNumber
+	}
+	return diff < 0
 }
 
 func (c *Client) getDataType(buf []byte) P2PDataType {
@@ -987,24 +1057,6 @@ func (c *Client) handleVideoData(seqNo uint16, header P2PDataHeader, data []byte
 		debuglog.Debugf("P2P: video frame ch=%d device=%s keyFrame=%v streamType=%d seqNo=%d fps=%d %dx%d dataLen=%d signCode=%d",
 			header.channel, deviceSN, metadata.IsKeyFrame, metadata.StreamType, metadata.VideoSeqNo, metadata.VideoFPS,
 			metadata.VideoWidth, metadata.VideoHeight, len(frameData), header.signCode)
-
-		ms := c.msgState[DataTypeVIDEO]
-
-		// Detect codec on first frame
-		if ms.videoCodec == VideoCodecUnknown {
-			ms.videoCodec = GetVideoCodec(frameData)
-			if ms.videoCodec == VideoCodecUnknown {
-				switch metadata.StreamType {
-				case 1:
-					ms.videoCodec = VideoCodecH264
-				case 2:
-					ms.videoCodec = VideoCodecH265
-				}
-			}
-			if ms.videoCodec != VideoCodecUnknown {
-				debuglog.Debugf("P2P: detected video codec: %d", ms.videoCodec)
-			}
-		}
 
 		if cb != nil {
 			if err := cb(deviceSN, frameData, metadata); err != nil {
@@ -1333,7 +1385,6 @@ func (c *Client) ClearVideoCallbackForDevice(deviceSN string) {
 			delete(c.videoStates, ch)
 		}
 	}
-	c.msgState[DataTypeVIDEO].videoCodec = VideoCodecUnknown
 }
 
 func (c *Client) handleTurnServerOK(payload []byte, raddr *net.UDPAddr) {

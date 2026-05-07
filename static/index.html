@@ -19,8 +19,9 @@
 		.btn { background: #2563eb; color: white; border: none; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; margin-top: 12px; }
 		.btn:hover { background: #1d4ed8; }
 		.btn:disabled { background: #6b7280; cursor: not-allowed; }
-		.btn.stop { background: #ef4444; }
-		.btn.stop:hover { background: #dc2626; }
+		.btn.loading { background: #3b82f6; position: relative; padding-left: 36px; }
+		.btn.loading::before { content: ''; position: absolute; left: 12px; top: 50%; width: 14px; height: 14px; margin-top: -7px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; }
+		@keyframes spin { to { transform: rotate(360deg); } }
 		.controls { margin-top: 20px; padding: 0 20px; }
 		#error { color: #ef4444; padding: 20px; background: #2d1f1f; border-radius: 8px; display: none; margin: 20px; }
 	</style>
@@ -134,17 +135,27 @@
 		}
 
 		async function watchLive(deviceSN, channel) {
+			const btn = event.target;
+			btn.disabled = true;
+			btn.classList.add('loading');
+			btn.textContent = 'Connecting...';
 			try {
 				const resp = await authFetch(`/api/stream/start/${deviceSN}?channel=${channel}`, { method: 'POST' });
 				if (!resp) return;
 				if (!resp.ok) {
 					const err = await resp.text();
 					showError(err);
+					btn.disabled = false;
+					btn.classList.remove('loading');
+					btn.textContent = 'Watch Live';
 					return;
 				}
 				window.location.href = `/stream/${deviceSN}?deviceSN=${deviceSN}&channel=${channel}`;
 			} catch (err) {
 				showError(err.message);
+				btn.disabled = false;
+				btn.classList.remove('loading');
+				btn.textContent = 'Watch Live';
 			}
 		}
 

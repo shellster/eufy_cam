@@ -81,9 +81,6 @@ func main() {
 	// Attempt initial login in background
 	go attemptLogin(ctx)
 
-	// Open browser
-	openBrowser(fmt.Sprintf("http://localhost:%d/login", cfg.Server.Port))
-
 	// Wait for shutdown
 	<-ctx.Done()
 }
@@ -103,6 +100,7 @@ func attemptLogin(ctx context.Context) {
 	if ok && loginErr.Captcha != nil {
 		log.Println("Captcha required — waiting for browser input...")
 		webServer.SetCaptcha(loginErr.Captcha)
+		openBrowser(fmt.Sprintf("http://localhost:%d/login", cfg.Server.Port))
 		return
 	}
 

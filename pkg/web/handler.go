@@ -109,7 +109,6 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/cameras", s.ListCamerasHandler).Methods("GET")
 	r.HandleFunc("/api/stations", s.ListStationsHandler).Methods("GET")
 	r.HandleFunc("/api/stream/start/{deviceSN}", s.StartStreamHandler).Methods("POST")
-	r.HandleFunc("/api/stream/stop/{deviceSN}", s.StopStreamHandler).Methods("POST")
 	r.HandleFunc("/api/stream/status/{deviceSN}", s.StreamStatusHandler).Methods("GET")
 	r.HandleFunc("/api/stream/{deviceSN}", s.StreamHandler).Methods("GET")
 	r.HandleFunc("/api/stream/ws/{deviceSN}", s.StreamWebSocketHandler)
@@ -311,7 +310,7 @@ func (s *Server) StartStreamHandler(w http.ResponseWriter, r *http.Request) {
 	deviceSN := vars["deviceSN"]
 
 	channelStr := r.URL.Query().Get("channel")
-	channel := 0
+	channel := -1
 	if channelStr != "" {
 		if ch, err := strconv.Atoi(channelStr); err == nil {
 			channel = ch
@@ -322,6 +321,10 @@ func (s *Server) StartStreamHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
+	}
+
+	if channel < 0 {
+		channel = device.Channel
 	}
 
 	station := devices.GetStation(device.StationSN)
@@ -361,15 +364,6 @@ func (s *Server) StartStreamHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "started", "device_sn": deviceSN})
 }
 
-func (s *Server) StopStreamHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	deviceSN := vars["deviceSN"]
-
-	s.stopLivestream(deviceSN)
-
-	w.Header().Set("Content-Type", "application/json")
-	writeJSON(w, map[string]string{"status": "stopped", "device_sn": deviceSN})
-}
 
 func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
