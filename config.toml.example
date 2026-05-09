@@ -10,11 +10,6 @@ language = "en"
 # Name shown in Eufy's trusted devices list. Cosmetic only, defaults to empty.
 trusted_device_name = ""
 
-# --- 2FA / Captcha (only needed if prompted during login) ---
-# verify_code = ""
-# captcha_id = ""
-# captcha_answer = ""
-
 [server]
 # Address to bind the HTTP server on. Default: "0.0.0.0"
 host = "0.0.0.0"
@@ -39,3 +34,10 @@ connection_type = 2
 # type = "digest"    # enables digest auth (omit to disable)
 # username = "admin"
 # password = "secret"
+
+[stream]
+# Public streaming port — serves MPEG-TS with no auth.
+# Streams auto-start on connect, teardown after last client leaves (30s grace).
+# enabled = true
+# port = 8090
+# bind = "0.0.0.0"
