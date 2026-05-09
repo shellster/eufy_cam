@@ -80,10 +80,6 @@ func (c *Client) loginWithCaptcha(captchaID, captchaAnswer string) error {
 		"transaction":     strconv.FormatInt(time.Now().UnixMilli(), 10),
 	}
 
-	if c.config.Eufy.VerifyCode != "" {
-		loginData["verify_code"] = c.config.Eufy.VerifyCode
-	}
-
 	if captchaID != "" && captchaAnswer != "" {
 		loginData["captcha_id"] = captchaID
 		loginData["answer"] = captchaAnswer

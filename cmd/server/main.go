@@ -24,10 +24,11 @@ import (
 )
 
 var (
-	cfg        *config.Config
-	apiClient  *api.Client
-	webServer  *web.Server
-	httpServer *http.Server
+	cfg             *config.Config
+	apiClient       *api.Client
+	webServer       *web.Server
+	httpServer      *http.Server
+	streamServer    *http.Server
 )
 
 func main() {
@@ -55,6 +56,9 @@ func main() {
 	log.Printf("Starting Eufy Camera Streamer...")
 	log.Printf("Config: Host=%s, Port=%d, Eufy Country=%s, P2P Type=%d",
 		cfg.Server.Host, cfg.Server.Port, cfg.Eufy.Country, cfg.P2P.ConnectionType)
+	if cfg.Stream.Enabled {
+		log.Printf("Config: Stream port=%d, Stream bind=%s", cfg.Stream.Port, cfg.Stream.Bind)
+	}
 
 	apiClient, err = api.Init(cfg)
 	if err != nil {
@@ -77,6 +81,11 @@ func main() {
 
 	// Start web server immediately — login/captcha handled via web UI
 	startWebServer(ctx)
+
+	// Start public stream server if enabled
+	if cfg.Stream.Enabled && cfg.Stream.Port > 0 {
+		startStreamServer(ctx)
+	}
 
 	// Attempt initial login in background
 	go attemptLogin(ctx)
@@ -224,6 +233,37 @@ func startWebServer(ctx context.Context) {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
 		_ = httpServer.Shutdown(shutdownCtx)
+	}()
+}
+
+func startStreamServer(ctx context.Context) {
+	streamRouter := mux.NewRouter()
+	webServer.RegisterStreamRoutes(streamRouter)
+
+	addr := fmt.Sprintf("%s:%d", cfg.Stream.Bind, cfg.Stream.Port)
+
+	streamServer = &http.Server{
+		Addr:         addr,
+		Handler:      recoveryMiddleware(streamRouter),
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 0,
+	}
+
+	go func() {
+		log.Printf("Starting stream server on %s (no auth)", addr)
+		if err := streamServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Stream server error: %v", err)
+		}
+	}()
+
+	log.Printf("Stream server listening on %s", addr)
+
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down stream server...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = streamServer.Shutdown(shutdownCtx)
 	}()
 }
 

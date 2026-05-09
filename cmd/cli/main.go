@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -18,92 +17,85 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/icholy/digest"
+	"github.com/spf13/cobra"
 )
 
-var (
-	serverURL = flag.String("server", "http://localhost:8080", "Server URL")
-	authUser  = flag.String("user", "", "Username for digest auth")
-	authPass  = flag.String("pass", "", "Password for digest auth")
-	servePort = flag.Int("port", 0, "Serve stream on this HTTP port instead of writing to stdout")
-	serveBind = flag.String("bind", "localhost", "Bind address for HTTP serve mode (use 0.0.0.0 for all interfaces)")
-)
+func main() {
+	rootCmd := &cobra.Command{
+		Use:   "eufy-cli [flags] <command> [args]",
+		Short: "Eufy camera P2P streaming CLI",
+		Example: `  eufy-cli list
+  eufy-cli --user admin --pass secret list
+  eufy-cli stream T8134P2024342790 | ffmpeg -i - -c copy out.ts
+  eufy-cli --port 8090 stream T8134P2024342790
+  eufy-cli --port 8090 --bind 0.0.0.0 stream T8134P2024342790`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
 
-func httpClient() *http.Client {
-	if *authUser != "" && *authPass != "" {
+	rootCmd.PersistentFlags().String("server", "http://localhost:8080", "Server URL")
+	rootCmd.PersistentFlags().String("user", "", "Username for digest auth")
+	rootCmd.PersistentFlags().String("pass", "", "Password for digest auth")
+
+	rootCmd.AddCommand(listCmd())
+	rootCmd.AddCommand(streamCmd())
+	rootCmd.CompletionOptions.HiddenDefaultCmd = true
+
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func listCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List available cameras",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			serverURL, _ := cmd.Flags().GetString("server")
+			user, _ := cmd.Flags().GetString("user")
+			pass, _ := cmd.Flags().GetString("pass")
+			return doList(serverURL, user, pass)
+		},
+	}
+}
+
+func streamCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "stream <deviceSN>",
+		Short: "Stream camera video to stdout or HTTP",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			serverURL, _ := cmd.Flags().GetString("server")
+			user, _ := cmd.Flags().GetString("user")
+			pass, _ := cmd.Flags().GetString("pass")
+			port, _ := cmd.Flags().GetInt("port")
+			bind, _ := cmd.Flags().GetString("bind")
+			deviceSN := args[0]
+
+			if port > 0 {
+				return doStreamServe(serverURL, user, pass, deviceSN, port, bind)
+			}
+			return doStream(serverURL, user, pass, deviceSN)
+		},
+	}
+
+	cmd.Flags().Int("port", 0, "Serve stream on this HTTP port instead of writing to stdout")
+	cmd.Flags().String("bind", "localhost", "Bind address for HTTP serve mode (use 0.0.0.0 for all interfaces)")
+
+	return cmd
+}
+
+func httpClient(user, pass string) *http.Client {
+	if user != "" && pass != "" {
 		return &http.Client{
 			Transport: &digest.Transport{
-				Username: *authUser,
-				Password: *authPass,
+				Username: user,
+				Password: pass,
 			},
 		}
 	}
 	return http.DefaultClient
-}
-
-func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <command> [args]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Commands:\n")
-		fmt.Fprintf(os.Stderr, "  list              List available cameras\n")
-		fmt.Fprintf(os.Stderr, "  stream <sn>       Stream camera video to stdout or HTTP\n\n")
-		fmt.Fprintf(os.Stderr, "Flags:\n")
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  %s list\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -user admin -pass secret list\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s stream T8134P2024342790 | ffmpeg -i - -c copy out.ts\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -port 8090 stream T8134P2024342790\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -port 8090 -bind 0.0.0.0 stream T8134P2024342790\n", os.Args[0])
-	}
-
-	// Reorder args so flags and their values precede positional args.
-	// Lets "eufy-cli stream SN --port 8090" work like "eufy-cli --port 8090 stream SN".
-	args := os.Args[1:]
-	var flagArgs, positionalArgs []string
-	for i := 0; i < len(args); i++ {
-		if strings.HasPrefix(args[i], "-") {
-			flagArgs = append(flagArgs, args[i])
-			if !strings.Contains(args[i], "=") {
-				name := strings.TrimLeft(args[i], "-")
-				if f := flag.Lookup(name); f != nil && f.DefValue != "true" && f.DefValue != "false" && i+1 < len(args) {
-					i++
-					flagArgs = append(flagArgs, args[i])
-				}
-			}
-		} else {
-			positionalArgs = append(positionalArgs, args[i])
-		}
-	}
-	os.Args = append([]string{os.Args[0]}, append(flagArgs, positionalArgs...)...)
-
-	flag.Parse()
-
-	if flag.NArg() < 1 {
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	cmd := flag.Arg(0)
-
-	switch cmd {
-	case "list":
-		doList()
-	case "stream":
-		if flag.NArg() < 2 {
-			fmt.Fprintf(os.Stderr, "Usage: %s stream <deviceSN>\n", os.Args[0])
-			os.Exit(1)
-		}
-		deviceSN := flag.Arg(1)
-		if *servePort > 0 {
-			doStreamServe(deviceSN, *servePort, *serveBind)
-		} else {
-			doStream(deviceSN)
-		}
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
-		flag.Usage()
-		os.Exit(1)
-	}
 }
 
 type camera struct {
@@ -114,30 +106,27 @@ type camera struct {
 	Channel    int    `json:"channel"`
 }
 
-func doList() {
-	client := httpClient()
-	resp, err := client.Get(*serverURL + "/api/cameras")
+func doList(serverURL, user, pass string) error {
+	client := httpClient(user, pass)
+	resp, err := client.Get(serverURL + "/api/cameras")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		fmt.Fprintf(os.Stderr, "Server returned %d: %s\n", resp.StatusCode, body)
-		os.Exit(1)
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, body)
 	}
 
 	var cameras []camera
 	if err := json.NewDecoder(resp.Body).Decode(&cameras); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error parsing response: %v", err)
 	}
 
 	if len(cameras) == 0 {
 		fmt.Println("No cameras found.")
-		return
+		return nil
 	}
 
 	fmt.Printf("%-25s %-30s %-20s %s\n", "DEVICE SN", "NAME", "MODEL", "CH")
@@ -145,11 +134,12 @@ func doList() {
 	for _, c := range cameras {
 		fmt.Printf("%-25s %-30s %-20s %d\n", c.DeviceSN, c.DeviceName, c.Model, c.Channel)
 	}
+	return nil
 }
 
-func lookupChannel(deviceSN string) (int, error) {
-	client := httpClient()
-	resp, err := client.Get(*serverURL + "/api/cameras")
+func lookupChannel(serverURL, user, pass, deviceSN string) (int, error) {
+	client := httpClient(user, pass)
+	resp, err := client.Get(serverURL + "/api/cameras")
 	if err != nil {
 		return 0, fmt.Errorf("failed to fetch camera list: %v", err)
 	}
@@ -173,37 +163,33 @@ func lookupChannel(deviceSN string) (int, error) {
 	return 0, fmt.Errorf("camera %s not found", deviceSN)
 }
 
-func doStream(deviceSN string) {
-	channel, err := lookupChannel(deviceSN)
+func doStream(serverURL, user, pass, deviceSN string) error {
+	channel, err := lookupChannel(serverURL, user, pass, deviceSN)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
-	client := httpClient()
+	client := httpClient(user, pass)
 
 	// Start stream
-	startURL := fmt.Sprintf("%s/api/stream/start/%s?channel=%d", *serverURL, deviceSN, channel)
+	startURL := fmt.Sprintf("%s/api/stream/start/%s?channel=%d", serverURL, deviceSN, channel)
 	resp, err := client.Post(startURL, "", nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error starting stream: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error starting stream: %v", err)
 	}
 	_ = resp.Body.Close()
 
 	if false {
 		body, _ := io.ReadAll(resp.Body)
-		fmt.Fprintf(os.Stderr, "Failed to start stream (HTTP %d): %s\n", resp.StatusCode, body)
-		os.Exit(1)
+		return fmt.Errorf("failed to start stream (HTTP %d): %s", resp.StatusCode, body)
 	}
 
 	// Open WebSocket for heartbeat
-	wsURL := wsURL(*serverURL, fmt.Sprintf("/api/stream/ws/%s", deviceSN))
-	wsConn, err := dialWebSocket(wsURL)
+	wsStr := wsURL(serverURL, fmt.Sprintf("/api/stream/ws/%s", deviceSN))
+	wsConn, err := dialWebSocket(wsStr, user, pass)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error connecting WebSocket: %v\n", err)
-		stopStream(deviceSN)
-		os.Exit(1)
+		stopStream(serverURL, user, pass, deviceSN)
+		return fmt.Errorf("error connecting WebSocket: %v", err)
 	}
 
 	// Heartbeat goroutine
@@ -228,23 +214,23 @@ func doStream(deviceSN string) {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		cleanup(deviceSN, wsConn, done)
+		cleanup(deviceSN, wsConn, done, serverURL, user, pass)
 		os.Exit(0)
 	}()
 
 	// Fetch MPEG-TS stream and write to stdout
-	streamURL := fmt.Sprintf("%s/api/stream/%s", *serverURL, deviceSN)
+	streamURL := fmt.Sprintf("%s/api/stream/%s", serverURL, deviceSN)
 	streamResp, err := client.Get(streamURL)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error fetching stream: %v\n", err)
-		cleanup(deviceSN, wsConn, done)
-		os.Exit(1)
+		cleanup(deviceSN, wsConn, done, serverURL, user, pass)
+		return fmt.Errorf("error fetching stream: %v", err)
 	}
 	defer func() { _ = streamResp.Body.Close() }()
 
 	_, _ = io.Copy(os.Stdout, streamResp.Body)
 
-	cleanup(deviceSN, wsConn, done)
+	cleanup(deviceSN, wsConn, done, serverURL, user, pass)
+	return nil
 }
 
 // fanWriter fans out data from a single reader to multiple HTTP clients.
@@ -293,36 +279,32 @@ func (f *fanWriter) count() int {
 	return len(f.writers)
 }
 
-func doStreamServe(deviceSN string, port int, bind string) {
-	channel, err := lookupChannel(deviceSN)
+func doStreamServe(serverURL, user, pass, deviceSN string, port int, bind string) error {
+	channel, err := lookupChannel(serverURL, user, pass, deviceSN)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
-	client := httpClient()
+	client := httpClient(user, pass)
 
 	// Start stream
-	startURL := fmt.Sprintf("%s/api/stream/start/%s?channel=%d", *serverURL, deviceSN, channel)
+	startURL := fmt.Sprintf("%s/api/stream/start/%s?channel=%d", serverURL, deviceSN, channel)
 	resp, err := client.Post(startURL, "", nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error starting stream: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error starting stream: %v", err)
 	}
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "Failed to start stream (HTTP %d)\n", resp.StatusCode)
-		os.Exit(1)
+		return fmt.Errorf("failed to start stream (HTTP %d)", resp.StatusCode)
 	}
 
 	// Open WebSocket for heartbeat
-	wsURL := wsURL(*serverURL, fmt.Sprintf("/api/stream/ws/%s", deviceSN))
-	wsConn, err := dialWebSocket(wsURL)
+	wsStr := wsURL(serverURL, fmt.Sprintf("/api/stream/ws/%s", deviceSN))
+	wsConn, err := dialWebSocket(wsStr, user, pass)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error connecting WebSocket: %v\n", err)
-		stopStream(deviceSN)
-		os.Exit(1)
+		stopStream(serverURL, user, pass, deviceSN)
+		return fmt.Errorf("error connecting WebSocket: %v", err)
 	}
 
 	done := make(chan struct{})
@@ -346,7 +328,7 @@ func doStreamServe(deviceSN string, port int, bind string) {
 	go func() {
 		<-sigChan
 		log.Println("Shutting down...")
-		cleanup(deviceSN, wsConn, done)
+		cleanup(deviceSN, wsConn, done, serverURL, user, pass)
 		os.Exit(0)
 	}()
 
@@ -355,7 +337,11 @@ func doStreamServe(deviceSN string, port int, bind string) {
 
 	// Start fetching from server in background
 	go func() {
-		streamURL := fmt.Sprintf("%s/api/stream/%s", *serverURL, deviceSN)
+		streamURL := fmt.Sprintf("%s/api/stream/%s", serverURL, deviceSN)
+		startURL := fmt.Sprintf("%s/api/stream/start/%s?channel=%d", serverURL, deviceSN, channel)
+		backoff := 2 * time.Second
+		maxBackoff := 30 * time.Second
+
 		for {
 			streamResp, err := client.Get(streamURL)
 			if err != nil {
@@ -363,18 +349,52 @@ func doStreamServe(deviceSN string, port int, bind string) {
 				select {
 				case <-done:
 					return
-				case <-time.After(2 * time.Second):
+				case <-time.After(backoff):
+					backoff = min(backoff*2, maxBackoff)
 					continue
 				}
 			}
-			_, _ = io.Copy(fan, streamResp.Body)
+
+			if streamResp.StatusCode == http.StatusNotFound {
+				_ = streamResp.Body.Close()
+				log.Println("Stream not found on server, restarting...")
+				startResp, err := client.Post(startURL, "", nil)
+				if err != nil {
+					log.Printf("Error restarting stream: %v", err)
+				} else {
+					_ = startResp.Body.Close()
+				}
+				select {
+				case <-done:
+					return
+				case <-time.After(backoff):
+					backoff = min(backoff*2, maxBackoff)
+					continue
+				}
+			}
+
+			n, _ := io.Copy(fan, streamResp.Body)
 			_ = streamResp.Body.Close()
+
 			select {
 			case <-done:
 				return
 			default:
-				log.Println("Stream ended, reconnecting...")
 			}
+
+			if n == 0 {
+				log.Printf("Stream ended immediately (0 bytes), reconnecting in %v...", backoff)
+				select {
+				case <-done:
+					return
+				case <-time.After(backoff):
+					backoff = min(backoff*2, maxBackoff)
+				}
+				continue
+			}
+
+			backoff = 2 * time.Second
+			log.Println("Stream ended, reconnecting...")
 		}
 	}()
 
@@ -412,9 +432,8 @@ func doStreamServe(deviceSN string, port int, bind string) {
 	addr := fmt.Sprintf("%s:%d", bind, port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", addr, err)
-		cleanup(deviceSN, wsConn, done)
-		os.Exit(1)
+		cleanup(deviceSN, wsConn, done, serverURL, user, pass)
+		return fmt.Errorf("error listening on %s: %v", addr, err)
 	}
 
 	log.Printf("Serving MPEG-TS stream for %s on http://%s/", deviceSN, addr)
@@ -438,16 +457,17 @@ func doStreamServe(deviceSN string, port int, bind string) {
 
 	srv := &http.Server{Handler: handler}
 	_ = srv.Serve(ln)
+	return nil
 }
 
-func dialWebSocket(wsURL string) (*websocket.Conn, error) {
-	if *authUser == "" || *authPass == "" {
-		return wsDial(wsURL, nil)
+func dialWebSocket(wsStr, user, pass string) (*websocket.Conn, error) {
+	if user == "" || pass == "" {
+		return wsDial(wsStr, nil)
 	}
 
 	// Make a preflight HTTP request to get the 401 digest challenge,
 	// then compute the Authorization header for the WebSocket upgrade.
-	httpURL := wsToHTTP(wsURL)
+	httpURL := wsToHTTP(wsStr)
 	resp, err := http.Get(httpURL)
 	if err != nil {
 		return nil, fmt.Errorf("digest preflight failed: %w", err)
@@ -456,7 +476,7 @@ func dialWebSocket(wsURL string) (*websocket.Conn, error) {
 
 	if resp.StatusCode != http.StatusUnauthorized {
 		// No auth needed
-		return wsDial(wsURL, nil)
+		return wsDial(wsStr, nil)
 	}
 
 	chal, err := digest.FindChallenge(resp.Header)
@@ -466,9 +486,9 @@ func dialWebSocket(wsURL string) (*websocket.Conn, error) {
 
 	cred, err := digest.Digest(chal, digest.Options{
 		Method:   "GET",
-		URI:      wsPath(wsURL),
-		Username: *authUser,
-		Password: *authPass,
+		URI:      wsPath(wsStr),
+		Username: user,
+		Password: pass,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("digest computation failed: %w", err)
@@ -477,20 +497,20 @@ func dialWebSocket(wsURL string) (*websocket.Conn, error) {
 	header := http.Header{}
 	header.Set("Authorization", cred.String())
 
-	return wsDial(wsURL, header)
+	return wsDial(wsStr, header)
 }
 
-func cleanup(deviceSN string, wsConn *websocket.Conn, done chan struct{}) {
+func cleanup(deviceSN string, wsConn *websocket.Conn, done chan struct{}, serverURL, user, pass string) {
 	close(done)
 	_ = wsConn.WriteMessage(websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	wsConn.Close() //nolint:errcheck
-	stopStream(deviceSN)
+	stopStream(serverURL, user, pass, deviceSN)
 }
 
-func stopStream(deviceSN string) {
-	client := httpClient()
-	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/stream/stop/%s", *serverURL, deviceSN), nil)
+func stopStream(serverURL, user, pass, deviceSN string) {
+	client := httpClient(user, pass)
+	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/stream/stop/%s", serverURL, deviceSN), nil)
 	resp, err := client.Do(req)
 	if err == nil {
 		_ = resp.Body.Close()
@@ -506,22 +526,22 @@ func wsURL(server, path string) string {
 	return scheme + "://" + u.Host + path
 }
 
-func wsToHTTP(wsURL string) string {
-	if strings.HasPrefix(wsURL, "wss://") {
-		return "https://" + wsURL[6:]
+func wsToHTTP(wsStr string) string {
+	if strings.HasPrefix(wsStr, "wss://") {
+		return "https://" + wsStr[6:]
 	}
-	return "http://" + strings.TrimPrefix(wsURL, "ws://")
+	return "http://" + strings.TrimPrefix(wsStr, "ws://")
 }
 
-func wsPath(wsURL string) string {
-	u, err := url.Parse(wsURL)
+func wsPath(wsStr string) string {
+	u, err := url.Parse(wsStr)
 	if err != nil {
 		return "/"
 	}
 	return u.RequestURI()
 }
 
-func wsDial(wsURL string, header http.Header) (*websocket.Conn, error) {
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+func wsDial(wsStr string, header http.Header) (*websocket.Conn, error) {
+	conn, _, err := websocket.DefaultDialer.Dial(wsStr, header)
 	return conn, err
 }

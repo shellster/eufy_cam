@@ -13,6 +13,7 @@ type Config struct {
 	Server ServerConfig  `toml:"server"`
 	P2P    P2PConfig     `toml:"p2p"`
 	Auth   AuthConfig    `toml:"auth"`
+	Stream StreamConfig  `toml:"stream"`
 }
 
 type EufyConfig struct {
@@ -21,9 +22,6 @@ type EufyConfig struct {
 	Country           string `toml:"country"`
 	Language          string `toml:"language"`
 	TrustedDeviceName string `toml:"trusted_device_name"`
-	VerifyCode        string
-	CaptchaID         string
-	CaptchaAnswer     string
 }
 
 type ServerConfig struct {
@@ -45,6 +43,12 @@ func (a *AuthConfig) IsDigest() bool {
 type P2PConfig struct {
 	LocalPort      int `toml:"local_port"`
 	ConnectionType int `toml:"connection_type"`
+}
+
+type StreamConfig struct {
+	Enabled bool   `toml:"enabled"`
+	Port    int    `toml:"port"`
+	Bind    string `toml:"bind"`
 }
 
 func Load(path string) (*Config, error) {
@@ -73,15 +77,6 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("EUFY_TRUSTED_DEVICE_NAME"); v != "" {
 		cfg.Eufy.TrustedDeviceName = v
-	}
-	if v := os.Getenv("EUFY_VERIFY_CODE"); v != "" {
-		cfg.Eufy.VerifyCode = v
-	}
-	if v := os.Getenv("EUFY_CAPTCHA_ID"); v != "" {
-		cfg.Eufy.CaptchaID = v
-	}
-	if v := os.Getenv("EUFY_CAPTCHA_ANSWER"); v != "" {
-		cfg.Eufy.CaptchaAnswer = v
 	}
 	if v := os.Getenv("SERVER_HOST"); v != "" {
 		cfg.Server.Host = v
@@ -116,6 +111,18 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("AUTH_PASSWORD"); v != "" {
 		cfg.Auth.Password = v
 	}
+	if v := os.Getenv("STREAM_ENABLED"); v != "" {
+		cfg.Stream.Enabled = v == "1" || v == "true" || v == "yes"
+	}
+	if v := os.Getenv("STREAM_PORT"); v != "" {
+		port, err := strconv.Atoi(v)
+		if err == nil {
+			cfg.Stream.Port = port
+		}
+	}
+	if v := os.Getenv("STREAM_BIND"); v != "" {
+		cfg.Stream.Bind = v
+	}
 
 	// Set defaults
 	if cfg.Eufy.Country == "" {
@@ -135,6 +142,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.P2P.ConnectionType == 0 {
 		cfg.P2P.ConnectionType = 2 // QUICKEST
+	}
+	if cfg.Stream.Bind == "" {
+		cfg.Stream.Bind = "0.0.0.0"
 	}
 
 	return &cfg, nil

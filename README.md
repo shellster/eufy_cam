@@ -31,9 +31,6 @@ All config values overridable via env vars:
 | `EUFY_COUNTRY` | `[eufy]` country | `US` |
 | `EUFY_LANGUAGE` | `[eufy]` language | `en` |
 | `EUFY_TRUSTED_DEVICE_NAME` | `[eufy]` trusted_device_name | |
-| `EUFY_VERIFY_CODE` | `[eufy]` verify_code | |
-| `EUFY_CAPTCHA_ID` | `[eufy]` captcha_id | |
-| `EUFY_CAPTCHA_ANSWER` | `[eufy]` captcha_answer | |
 | `SERVER_HOST` | `[server]` host | `0.0.0.0` |
 | `SERVER_PORT` | `[server]` port | `8080` |
 | `SERVER_DEBUG` | `[server]` debug | `false` |
@@ -42,6 +39,9 @@ All config values overridable via env vars:
 | `AUTH_TYPE` | `[auth]` type | |
 | `AUTH_USERNAME` | `[auth]` username | |
 | `AUTH_PASSWORD` | `[auth]` password | |
+| `STREAM_ENABLED` | `[stream]` enabled | `false` |
+| `STREAM_PORT` | `[stream]` port | |
+| `STREAM_BIND` | `[stream]` bind | `0.0.0.0` |
 
 Env vars override `config.toml` values when set.
 
@@ -59,10 +59,33 @@ Opens browser to `http://localhost:8080/login`. Web UI handles login + captcha (
 You can protect the server with digest auth if you want (see `[auth]` section of the toml).  If you want TLS, you should front the server via nginx or similar.
 
 
-You can view your cameras and stream directly from the server ux.  That said, for forwarding your cameras to frigate or similar, you'll need the CLI piece.
+You can view your cameras and stream directly from the server ux.  That said, for forwarding your cameras to frigate or similar, you'll need the CLI piece or to enable the stream feature.
 Eufy will frequently prompt for CAPTCHA's on login.  Therefore once the server is running and maintaining a session, you can use the CLI tool to stream camera feeds from your server.
 The server handles the P2P streaming and maintaining the session.  The cli tool borrows the session from the server and can steam mpeg-ts directly to stdout so that you can pipe it wherever you want
 You can of course pipe this to ffmpeg and do anything you want with it.
+
+### Public Stream Port
+
+Enable a second HTTP port that serves raw MPEG-TS streams with no authentication. Streams auto-start on connect and teardown after all clients disconnect (30s grace).  If you enable this feature, these streams will be unauthenticated.  You can still use the eufy-cli client without this feature enabled to have an authenticated stream.
+
+```toml
+[stream]
+enabled = true
+port = 8090
+bind = "0.0.0.0"
+```
+
+Then connect directly:
+
+```bash
+# Stream a camera
+ffplay http://localhost:8090/T8134P2024342790
+
+# Use in frigate
+ffmpeg -i http://localhost:8090/T8134P2024342790 ...
+```
+
+Multiple clients can connect to the same camera URL. When the last client disconnects, the P2P stream is torn down after 30 seconds.
 
 
 **CLI:**
@@ -120,6 +143,8 @@ Because existing tools had subtle bugs and were written in NodeJS which made the
 - 1.0.1 May 6th 2026:  Support multiple client streams from the same camera and stale stream automatic restart
 
 - 1.0.2 May 7th 2026:  Support multiple camera streams at the same time, clean-up the UX, cli can serve stream via port or stdout
+
+- 1.0.3 May 8th 2026:  Add server stream feature, clean-up some dumb LLM garbage.
 
 ## Credit
 
