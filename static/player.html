@@ -37,6 +37,9 @@
 		let statusInterval = null;
 		let heartbeatWs = null;
 		let heartbeatInterval = null;
+		let retryCount = 0;
+		const maxRetries = 5;
+		const retryDelay = 3000;
 
 		async function authFetch(url, options) {
 			const resp = await fetch(url, options);
@@ -49,6 +52,29 @@
 
 		function dbg(msg) {
 			dbgEl.textContent = msg;
+		}
+
+		function cleanup() {
+			if (statusInterval) {
+				clearInterval(statusInterval);
+				statusInterval = null;
+			}
+			if (heartbeatInterval) {
+				clearInterval(heartbeatInterval);
+				heartbeatInterval = null;
+			}
+			if (heartbeatWs) {
+				heartbeatWs.onclose = null;
+				heartbeatWs.close();
+				heartbeatWs = null;
+			}
+			if (player) {
+				try { player.pause(); } catch(e) {}
+				try { player.unload(); } catch(e) {}
+				try { player.detachMediaElement(); } catch(e) {}
+				try { player.destroy(); } catch(e) {}
+				player = null;
+			}
 		}
 
 		function startHeartbeat() {
@@ -122,8 +148,16 @@
 				player.attachMediaElement(video);
 
 				player.on(mpegts.Events.ERROR, (errorType, errorDetail, errorInfo) => {
-					msgEl.textContent = 'Player error: ' + errorDetail;
 					console.error('mpegts error:', errorType, errorDetail, errorInfo);
+					cleanup();
+
+					if (retryCount < maxRetries) {
+						retryCount++;
+						msgEl.innerHTML = `<span class="spinner"></span>Stream error, retrying (${retryCount}/${maxRetries})...`;
+						setTimeout(startStream, retryDelay);
+					} else {
+						msgEl.textContent = 'Stream failed after ' + maxRetries + ' retries: ' + errorDetail;
+					}
 				});
 
 				player.on(mpegts.Events.STATISTICS_INFO, (info) => {
@@ -135,7 +169,10 @@
 				});
 
 				player.load();
-				video.addEventListener('playing', () => { msgEl.textContent = ''; }, { once: true });
+				video.addEventListener('playing', () => {
+					msgEl.textContent = '';
+					retryCount = 0;
+				}, { once: true });
 				player.play().catch(() => {});
 
 				msgEl.innerHTML = '<span class="spinner"></span>Buffering...';

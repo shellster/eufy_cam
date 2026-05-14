@@ -764,6 +764,9 @@ func (c *Client) handleDataMessage(payload []byte, raddr *net.UDPAddr) {
 						c.mu.Lock()
 						c.expectedSeqNo[dtIdx] = lowest
 						c.mu.Unlock()
+						for ch := range c.videoStates {
+							c.videoStates[ch] = &VideoFrameState{}
+						}
 						continue
 					}
 					c.mu.Lock()

@@ -44,7 +44,10 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 	}
 
 	s.NextFrameID++
-	s.FrameBuffer = append(s.FrameBuffer, frameData)
+	s.FrameBuffer = append(s.FrameBuffer, TimedFrame{
+		Data: frameData,
+		PTS:  metadata.VideoTimestamp,
+	})
 	s.frameIDs = append(s.frameIDs, s.NextFrameID)
 
 	if metadata.IsKeyFrame {
@@ -55,7 +58,7 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 	dropped := 0
 	var totalBytes int
 	for i := len(s.FrameBuffer) - 1; i >= 0; i-- {
-		totalBytes += len(s.FrameBuffer[i])
+		totalBytes += len(s.FrameBuffer[i].Data)
 		if totalBytes > maxBufferBytes {
 			dropped = i + 1
 			break
@@ -84,7 +87,7 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 // GetFramesSince returns all frames after sinceID. If sinceID is before the
 // last keyframe, frames start from the keyframe so the client can resync.
 // Returns the frames and the nextID to pass on the next call.
-func (s *StreamSession) GetFramesSince(sinceID int) ([][]byte, int) {
+func (s *StreamSession) GetFramesSince(sinceID int) ([]TimedFrame, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -110,7 +113,7 @@ func (s *StreamSession) GetFramesSince(sinceID int) ([][]byte, int) {
 		return nil, s.NextFrameID
 	}
 
-	frames := make([][]byte, len(s.FrameBuffer)-startIdx)
+	frames := make([]TimedFrame, len(s.FrameBuffer)-startIdx)
 	copy(frames, s.FrameBuffer[startIdx:])
 	return frames, s.NextFrameID
 }
