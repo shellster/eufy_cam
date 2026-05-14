@@ -145,9 +145,16 @@ func loadStations(ctx context.Context) error {
 			continue
 		}
 
-		if devices.GetStation(st.StationSN) == nil {
-			devices.AddOrUpdateStation(&st)
+		s := devices.GetStation(st.StationSN)
+		if s == nil {
+			s = devices.AddOrUpdateStation(&st)
 		}
+		s.SetP2PTimeouts(
+			time.Duration(cfg.P2P.ConnectionTimeout)*time.Second,
+			time.Duration(cfg.P2P.EncryptionTimeout)*time.Second,
+			time.Duration(cfg.P2P.AckTimeout)*time.Second,
+			cfg.P2P.DiscoveryAttempts,
+		)
 	}
 
 	return connectStations(ctx)

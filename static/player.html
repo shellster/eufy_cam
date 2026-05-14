@@ -6,8 +6,8 @@
 	<title>Camera Player</title>
 	<style>
 		body { margin: 0; background: #000; overflow: hidden; font-family: sans-serif; }
-		video { width: 100vw; height: 100vh; object-fit: contain; }
-		.overlay { position: fixed; top: 20px; left: 20px; background: rgba(0,0,0,0.7); padding: 10px 20px; border-radius: 8px; }
+		video { width: 100vw; height: calc(100vh - 60px); object-fit: contain; display: block; }
+		.overlay { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.8); padding: 8px 12px; z-index: 10; }
 		.overlay button { background: #fff; border: none; padding: 8px 16px; border-radius: 4px; font-weight: 600; cursor: pointer; margin-right: 8px; }
 		.overlay button:hover { background: #ddd; }
 		.message { color: #fff; margin-bottom: 8px; font-size: 14px; }
@@ -33,28 +33,54 @@
 		const params = new URLSearchParams(window.location.search);
 		const deviceSN = params.get('deviceSN') || window.location.pathname.split('/').pop();
 
+		const maxRetries = 10;
+
 		let player = null;
 		let statusInterval = null;
 		let heartbeatWs = null;
 		let heartbeatInterval = null;
+		let stallCheckInterval = null;
 		let retryCount = 0;
-		const maxRetries = 5;
-		const retryDelay = 3000;
 
-		async function authFetch(url, options) {
-			const resp = await fetch(url, options);
-			if (resp.status === 401) {
-				window.location.reload();
-				return null;
-			}
-			return resp;
-		}
+		let streamStartTime = 0;
+		let lastProgressTime = 0;
+		let lastDecodedFrames = 0;
+		let isRecovering = false;
+
+		let onVideoPlaying = null;
+		let onVideoError = null;
 
 		function dbg(msg) {
 			dbgEl.textContent = msg;
 		}
 
+		function getRetryDelay() {
+			const delay = Math.min(2000 * Math.pow(2, retryCount), 30000);
+			return delay;
+		}
+
+		async function authFetch(url, options) {
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 90000);
+			try {
+				const resp = await fetch(url, { ...options, signal: controller.signal });
+				clearTimeout(timeout);
+				if (resp.status === 401) {
+					window.location.reload();
+					return null;
+				}
+				return resp;
+			} catch (e) {
+				clearTimeout(timeout);
+				throw e;
+			}
+		}
+
 		function cleanup() {
+			if (stallCheckInterval) {
+				clearInterval(stallCheckInterval);
+				stallCheckInterval = null;
+			}
 			if (statusInterval) {
 				clearInterval(statusInterval);
 				statusInterval = null;
@@ -75,6 +101,33 @@
 				try { player.destroy(); } catch(e) {}
 				player = null;
 			}
+			if (onVideoPlaying) {
+				video.removeEventListener('playing', onVideoPlaying);
+				onVideoPlaying = null;
+			}
+			if (onVideoError) {
+				video.removeEventListener('error', onVideoError);
+				onVideoError = null;
+			}
+		}
+
+		function initiateRecovery(reason) {
+			if (isRecovering) return;
+			isRecovering = true;
+			retryCount++;
+			console.log(`Recovery #${retryCount}: ${reason}`);
+			cleanup();
+			lastDecodedFrames = 0;
+			lastProgressTime = 0;
+			streamStartTime = 0;
+			if (retryCount > maxRetries) {
+				msgEl.textContent = 'Stream failed after ' + maxRetries + ' retries';
+				isRecovering = false;
+				return;
+			}
+			const delay = getRetryDelay();
+			msgEl.innerHTML = `<span class="spinner"></span>Recovery #${retryCount} (${delay/1000}s)...`;
+			setTimeout(() => { startStream().catch(e => console.error('startStream failed:', e)); }, delay);
 		}
 
 		function startHeartbeat() {
@@ -102,7 +155,7 @@
 				const resp = await authFetch(`/api/stream/status/${deviceSN}`);
 				if (!resp) return;
 				const status = await resp.json();
-				dbg(`stream=${status.active} frames=${status.frameCount} codec=${status.codec}`);
+				dbg(`stream=${status.active} frames=${status.framesCount} codec=${status.codec} retries=${retryCount}`);
 			} catch (e) {}
 		}
 
@@ -121,7 +174,14 @@
 				msgEl.innerHTML = '<span class="spinner"></span>Establishing P2P connection...';
 
 				const channel = params.get('channel') || '0';
-				const startResp = await authFetch(`/api/stream/start/${deviceSN}?channel=${channel}`, { method: 'POST' });
+				let startResp;
+				try {
+					startResp = await authFetch(`/api/stream/start/${deviceSN}?channel=${channel}`, { method: 'POST' });
+				} catch (e) {
+					console.error('Stream start request failed:', e);
+					initiateRecovery('start request failed: ' + e.message);
+					return;
+				}
 				if (!startResp || !startResp.ok) {
 					const errText = startResp ? await startResp.text() : 'Authentication required';
 					msgEl.textContent = 'Failed to start stream: ' + errText;
@@ -149,19 +209,15 @@
 
 				player.on(mpegts.Events.ERROR, (errorType, errorDetail, errorInfo) => {
 					console.error('mpegts error:', errorType, errorDetail, errorInfo);
-					cleanup();
-
-					if (retryCount < maxRetries) {
-						retryCount++;
-						msgEl.innerHTML = `<span class="spinner"></span>Stream error, retrying (${retryCount}/${maxRetries})...`;
-						setTimeout(startStream, retryDelay);
-					} else {
-						msgEl.textContent = 'Stream failed after ' + maxRetries + ' retries: ' + errorDetail;
-					}
+					initiateRecovery('mpegts error: ' + errorDetail);
 				});
 
 				player.on(mpegts.Events.STATISTICS_INFO, (info) => {
-					dbg(`decoded=${info.decodedFrames || 0} speed=${info.speed || 0}x`);
+					const decoded = info.decodedFrames || 0;
+					if (decoded > lastDecodedFrames) {
+						lastDecodedFrames = decoded;
+						lastProgressTime = Date.now();
+					}
 				});
 
 				player.on(mpegts.Events.LOADING_COMPLETE, () => {
@@ -169,25 +225,53 @@
 				});
 
 				player.load();
-				video.addEventListener('playing', () => {
+
+				onVideoPlaying = () => {
 					msgEl.textContent = '';
 					retryCount = 0;
-				}, { once: true });
+					lastProgressTime = Date.now();
+				};
+				onVideoError = (e) => {
+					console.log('Video element error:', e);
+					initiateRecovery('video element error');
+				};
+				video.addEventListener('playing', onVideoPlaying);
+				video.addEventListener('error', onVideoError);
+
 				player.play().catch(() => {});
 
+				isRecovering = false;
+				streamStartTime = Date.now();
+				lastProgressTime = 0;
+				lastDecodedFrames = 0;
 				msgEl.innerHTML = '<span class="spinner"></span>Buffering...';
+
+				stallCheckInterval = setInterval(() => {
+					if (!player || isRecovering) return;
+					const now = Date.now();
+
+					if (lastProgressTime === 0) {
+						if (now - streamStartTime > 15000) {
+							initiateRecovery('buffering timeout >15s');
+						}
+						return;
+					}
+
+					if (now - lastProgressTime > 10000) {
+						initiateRecovery('no decode progress for 10s');
+					}
+				}, 3000);
 
 				startHeartbeat();
 
-				statusInterval = setInterval(pollStatus, 2000);
+				statusInterval = setInterval(pollStatus, 5000);
 				pollStatus();
 			} catch (err) {
 				msgEl.textContent = 'Error: ' + err.message;
 			}
 		}
 
-
-		startStream();
+		startStream().catch(e => console.error('startStream failed:', e));
 	</script>
 </body>
 </html>

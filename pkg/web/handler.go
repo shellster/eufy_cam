@@ -233,9 +233,6 @@ func (s *Server) StreamPortHandler(w http.ResponseWriter, r *http.Request) {
 			lastFrameID = nextID
 			if len(frames) > 0 {
 				for _, frame := range frames {
-					if !isValidNAL(frame.Data) {
-						continue
-					}
 					if muxer == nil {
 						codec := mpegts.CodecH264
 						if strm.Codec == 2 {
@@ -581,7 +578,6 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-ticker.C:
-			// Re-check stream is still active (WS heartbeat controls lifecycle)
 			if stream.GetStream(deviceSN) == nil {
 				return
 			}
@@ -593,9 +589,6 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 			lastFrameID = nextID
 			if len(frames) > 0 {
 				for _, frame := range frames {
-					if !isValidNAL(frame.Data) {
-						continue
-					}
 					if muxer == nil {
 						codec := mpegts.CodecH264
 						if strm.Codec == 2 {
@@ -748,24 +741,16 @@ func (s *Server) onVideoFrame(deviceSN string, frameData []byte, metadata p2p.Vi
 	return nil
 }
 
-func isValidNAL(data []byte) bool {
-	if len(data) < 4 {
-		return false
-	}
-	if data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1 {
-		return true
-	}
-	if data[0] == 0 && data[1] == 0 && data[2] == 1 {
-		return true
-	}
-	return false
-}
 
 func (s *Server) restartStaleStream(deviceSN string) {
 	strm := stream.GetStream(deviceSN)
 	if strm == nil {
 		return
 	}
+
+	strm.RestartMu.Lock()
+	defer strm.RestartMu.Unlock()
+
 	if !strm.IsStale() {
 		return
 	}

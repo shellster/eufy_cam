@@ -92,6 +92,9 @@ type Client struct {
 	turnHandshaking map[string]bool
 	turnConfirmed   bool
 
+	discoveryAttempts int
+	ackTimeout        time.Duration
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	mu     sync.Mutex
@@ -158,18 +161,20 @@ type MessageState struct {
 
 func NewClient(station *api.Station, dskKey string, apiClient APICipherGetter) *Client {
 	c := &Client{
-		station:         station,
-		apiClient:       apiClient,
-		dskKey:          dskKey,
-		connected:       false,
-		connecting:      false,
-		encryption:      EncryptionTypeNone,
-		encryptionReady: make(chan struct{}),
-		connectedReady:  make(chan struct{}),
-		videoRoutes:     make(map[byte]*videoRoute),
-		videoStates:     make(map[byte]*VideoFrameState),
-		messageStates:   make(map[uint16]*MessageState),
-		turnHandshaking: make(map[string]bool),
+		station:           station,
+		apiClient:         apiClient,
+		dskKey:            dskKey,
+		connected:         false,
+		connecting:        false,
+		encryption:        EncryptionTypeNone,
+		encryptionReady:   make(chan struct{}),
+		connectedReady:    make(chan struct{}),
+		videoRoutes:       make(map[byte]*videoRoute),
+		videoStates:       make(map[byte]*VideoFrameState),
+		messageStates:     make(map[uint16]*MessageState),
+		turnHandshaking:   make(map[string]bool),
+		discoveryAttempts: 15,
+		ackTimeout:        10 * time.Second,
 	}
 	for i := 0; i < 4; i++ {
 		c.msgBuilder[i] = &MessageBuilder{messages: make(map[int][]byte)}
@@ -252,6 +257,13 @@ func (c *Client) SetRSAKey(key *rsa.PrivateKey) {
 	c.rsaKey = key
 }
 
+func (c *Client) SetTimeouts(discoveryAttempts int, ackTimeout time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.discoveryAttempts = discoveryAttempts
+	c.ackTimeout = ackTimeout
+}
+
 func (c *Client) WaitForEncryption(timeout time.Duration) bool {
 	select {
 	case <-c.encryptionReady:
@@ -265,8 +277,13 @@ func (c *Client) discoveryLoop() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
+	c.mu.Lock()
+	maxAttempts := c.discoveryAttempts
+	c.mu.Unlock()
+	if maxAttempts <= 0 {
+		maxAttempts = 15
+	}
 	attempts := 0
-	maxAttempts := 15
 
 	for {
 		select {
@@ -484,7 +501,7 @@ func (c *Client) connectToAddr(addr *net.UDPAddr) {
 }
 
 func (c *Client) readLoop() {
-	buf := make([]byte, 2048)
+	buf := make([]byte, 65535)
 
 	for {
 		select {
@@ -763,10 +780,10 @@ func (c *Client) handleDataMessage(payload []byte, raddr *net.UDPAddr) {
 						}
 						c.mu.Lock()
 						c.expectedSeqNo[dtIdx] = lowest
-						c.mu.Unlock()
 						for ch := range c.videoStates {
 							c.videoStates[ch] = &VideoFrameState{}
 						}
+						c.mu.Unlock()
 						continue
 					}
 					c.mu.Lock()
@@ -830,11 +847,13 @@ func (c *Client) processVideoPacket(seqNo uint16, data []byte) {
 		ch = c.lastVideoChannel
 	}
 
+	c.mu.Lock()
 	vs := c.videoStates[ch]
 	if vs == nil {
 		vs = &VideoFrameState{}
 		c.videoStates[ch] = vs
 	}
+	c.mu.Unlock()
 
 	if len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord {
 		header := P2PDataHeader{}
@@ -1316,7 +1335,14 @@ func (c *Client) executeSend(msg *QueuedMessage) {
 	c.messageStates[seq] = state
 	c.mu.Unlock()
 
-	state.timeout = time.AfterFunc(10*time.Second, func() {
+	c.mu.Lock()
+	ackTimeout := c.ackTimeout
+	c.mu.Unlock()
+	if ackTimeout <= 0 {
+		ackTimeout = 10 * time.Second
+	}
+
+	state.timeout = time.AfterFunc(ackTimeout, func() {
 		c.mu.Lock()
 		delete(c.messageStates, seq)
 		c.mu.Unlock()

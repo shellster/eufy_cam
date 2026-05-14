@@ -36,6 +36,10 @@ All config values overridable via env vars:
 | `SERVER_DEBUG` | `[server]` debug | `false` |
 | `P2P_LOCAL_PORT` | `[p2p]` local_port | `0` (random) |
 | `P2P_CONNECTION_TYPE` | `[p2p]` connection_type | `2` |
+| `P2P_CONNECTION_TIMEOUT` | `[p2p]` connection_timeout | `60` |
+| `P2P_ENCRYPTION_TIMEOUT` | `[p2p]` encryption_timeout | `30` |
+| `P2P_DISCOVERY_ATTEMPTS` | `[p2p]` discovery_attempts | `30` |
+| `P2P_ACK_TIMEOUT` | `[p2p]` ack_timeout | `15` |
 | `AUTH_TYPE` | `[auth]` type | |
 | `AUTH_USERNAME` | `[auth]` username | |
 | `AUTH_PASSWORD` | `[auth]` password | |
@@ -145,6 +149,8 @@ Because existing tools had subtle bugs and were written in NodeJS which made the
 - 1.0.2 May 7th 2026:  Support multiple camera streams at the same time, clean-up the UX, cli can serve stream via port or stdout
 
 - 1.0.3 May 8th 2026:  Add server stream feature, clean-up some dumb LLM garbage.
+
+- 1.0.4 May 14th 2026: Fix video stream smearing/stalling (PTS mangling, keyframe index bug, videoStates data race). Add configurable P2P timeouts for internet/cloud relay connections.
 
 ## Credit
 

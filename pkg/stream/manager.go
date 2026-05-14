@@ -8,8 +8,9 @@ import (
 )
 
 type TimedFrame struct {
-	Data []byte
-	PTS  uint64
+	Data       []byte
+	PTS        uint64
+	IsKeyFrame bool
 }
 
 type StreamSession struct {
@@ -26,6 +27,7 @@ type StreamSession struct {
 	StartedAt       int64
 	LastUpdate      int64
 	mu              sync.Mutex
+	RestartMu       sync.Mutex
 }
 
 var (

@@ -45,8 +45,9 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 
 	s.NextFrameID++
 	s.FrameBuffer = append(s.FrameBuffer, TimedFrame{
-		Data: frameData,
-		PTS:  metadata.VideoTimestamp,
+		Data:       frameData,
+		PTS:        metadata.VideoTimestamp,
+		IsKeyFrame: metadata.IsKeyFrame,
 	})
 	s.frameIDs = append(s.frameIDs, s.NextFrameID)
 
@@ -67,20 +68,14 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 	if dropped > 0 {
 		s.FrameBuffer = s.FrameBuffer[dropped:]
 		s.frameIDs = s.frameIDs[dropped:]
-		s.lastKeyFrameIdx -= dropped
-		if s.lastKeyFrameIdx < 0 {
-			s.lastKeyFrameIdx = 0
-		}
+		s.recalcKeyFrameIdx()
 	}
 
 	if len(s.FrameBuffer) > maxFrames {
 		dropCount := len(s.FrameBuffer) - maxFrames
 		s.FrameBuffer = s.FrameBuffer[dropCount:]
 		s.frameIDs = s.frameIDs[dropCount:]
-		s.lastKeyFrameIdx -= dropCount
-		if s.lastKeyFrameIdx < 0 {
-			s.lastKeyFrameIdx = 0
-		}
+		s.recalcKeyFrameIdx()
 	}
 }
 
@@ -138,4 +133,14 @@ func (s *StreamSession) FrameCount() int {
 	defer s.mu.Unlock()
 
 	return len(s.FrameBuffer)
+}
+
+func (s *StreamSession) recalcKeyFrameIdx() {
+	s.lastKeyFrameIdx = 0
+	for i, f := range s.FrameBuffer {
+		if f.IsKeyFrame {
+			s.lastKeyFrameIdx = i
+			break
+		}
+	}
 }

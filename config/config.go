@@ -41,8 +41,12 @@ func (a *AuthConfig) IsDigest() bool {
 }
 
 type P2PConfig struct {
-	LocalPort      int `toml:"local_port"`
-	ConnectionType int `toml:"connection_type"`
+	LocalPort         int `toml:"local_port"`
+	ConnectionType    int `toml:"connection_type"`
+	ConnectionTimeout int `toml:"connection_timeout"`
+	EncryptionTimeout int `toml:"encryption_timeout"`
+	DiscoveryAttempts int `toml:"discovery_attempts"`
+	AckTimeout        int `toml:"ack_timeout"`
 }
 
 type StreamConfig struct {
@@ -102,6 +106,26 @@ func Load(path string) (*Config, error) {
 			cfg.P2P.ConnectionType = typ
 		}
 	}
+	if v := os.Getenv("P2P_CONNECTION_TIMEOUT"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.P2P.ConnectionTimeout = i
+		}
+	}
+	if v := os.Getenv("P2P_ENCRYPTION_TIMEOUT"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.P2P.EncryptionTimeout = i
+		}
+	}
+	if v := os.Getenv("P2P_DISCOVERY_ATTEMPTS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.P2P.DiscoveryAttempts = i
+		}
+	}
+	if v := os.Getenv("P2P_ACK_TIMEOUT"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.P2P.AckTimeout = i
+		}
+	}
 	if v := os.Getenv("AUTH_TYPE"); v != "" {
 		cfg.Auth.Type = v
 	}
@@ -142,6 +166,18 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.P2P.ConnectionType == 0 {
 		cfg.P2P.ConnectionType = 2 // QUICKEST
+	}
+	if cfg.P2P.ConnectionTimeout == 0 {
+		cfg.P2P.ConnectionTimeout = 60
+	}
+	if cfg.P2P.EncryptionTimeout == 0 {
+		cfg.P2P.EncryptionTimeout = 30
+	}
+	if cfg.P2P.DiscoveryAttempts == 0 {
+		cfg.P2P.DiscoveryAttempts = 30
+	}
+	if cfg.P2P.AckTimeout == 0 {
+		cfg.P2P.AckTimeout = 15
 	}
 	if cfg.Stream.Bind == "" {
 		cfg.Stream.Bind = "0.0.0.0"
