@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+type TimedFrame struct {
+	Data       []byte
+	PTS        uint64
+	IsKeyFrame bool
+}
+
 type StreamSession struct {
 	ID              int64
 	DeviceSN        string
@@ -14,13 +20,14 @@ type StreamSession struct {
 	Channel         int
 	Codec           int
 	IsMuxed         bool
-	FrameBuffer     [][]byte
+	FrameBuffer     []TimedFrame
 	frameIDs        []int
 	NextFrameID     int
 	lastKeyFrameIdx int
 	StartedAt       int64
 	LastUpdate      int64
 	mu              sync.Mutex
+	RestartMu       sync.Mutex
 }
 
 var (
@@ -39,7 +46,7 @@ func StartStream(deviceSN, stationSN string, channel, codec int) *StreamSession 
 		Station:     stationSN,
 		Channel:     channel,
 		Codec:       codec,
-		FrameBuffer: make([][]byte, 0),
+		FrameBuffer: make([]TimedFrame, 0),
 		StartedAt:   time.Now().UnixMilli(),
 		LastUpdate:  time.Now().UnixMilli(),
 	}

@@ -1,0 +1,16 @@
+services:
+  eufy-server:
+    build: .
+    container_name: eufy-server
+    restart: unless-stopped
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+    ports:
+      - "8080:8080"
+      - "8090:8090"
+    networks:
+      - eufy-net
+
+networks:
+  eufy-net:
+    driver: bridge

@@ -20,6 +20,10 @@ type Station struct {
 	apiClient     *api.Client
 	dskKey        string
 	streamClients map[string]*p2p.Client
+	connTimeout   time.Duration
+	encTimeout    time.Duration
+	discAttempts  int
+	ackTimeout    time.Duration
 	mu            sync.Mutex
 }
 
@@ -51,6 +55,11 @@ func (s *Station) ConnectWithAPI(dskKey string, apiClient *api.Client) error {
 	s.apiClient = apiClient
 	s.dskKey = dskKey
 
+	connTimeout := s.connTimeout
+	encTimeout := s.encTimeout
+	discAttempts := s.discAttempts
+	ackTimeout := s.ackTimeout
+
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		s.mu.Unlock()
@@ -60,6 +69,9 @@ func (s *Station) ConnectWithAPI(dskKey string, apiClient *api.Client) error {
 
 	p2pClient := p2p.NewClient(s.apiStation, dskKey, apiClient)
 	p2pClient.SetRSAKey(rsaKey)
+	if discAttempts > 0 || ackTimeout > 0 {
+		p2pClient.SetTimeouts(discAttempts, ackTimeout)
+	}
 	s.p2pClient = p2pClient
 	s.mu.Unlock()
 
@@ -68,12 +80,12 @@ func (s *Station) ConnectWithAPI(dskKey string, apiClient *api.Client) error {
 	}
 
 	debuglog.Debugf("Station %s: waiting for P2P connection...", s.GetSerial())
-	if !p2pClient.WaitForConnection(30 * time.Second) {
+	if !p2pClient.WaitForConnection(connTimeout) {
 		return fmt.Errorf("station %s: P2P connection timeout", s.GetSerial())
 	}
 	debuglog.Debugf("Station %s: P2P connected, waiting for encryption...", s.GetSerial())
 
-	if !p2pClient.WaitForEncryption(15 * time.Second) {
+	if !p2pClient.WaitForEncryption(encTimeout) {
 		return fmt.Errorf("station %s: encryption setup timeout", s.GetSerial())
 	}
 	debuglog.Debugf("Station %s: encryption ready", s.GetSerial())
@@ -101,6 +113,15 @@ func (s *Station) Disconnect() error {
 	return err
 }
 
+func (s *Station) SetP2PTimeouts(connTimeout, encTimeout, ackTimeout time.Duration, discAttempts int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.connTimeout = connTimeout
+	s.encTimeout = encTimeout
+	s.ackTimeout = ackTimeout
+	s.discAttempts = discAttempts
+}
+
 func (s *Station) IsConnected() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -120,6 +141,10 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 	s.mu.Lock()
 	dskKey := s.dskKey
 	apiClient := s.apiClient
+	connTimeout := s.connTimeout
+	encTimeout := s.encTimeout
+	discAttempts := s.discAttempts
+	ackTimeout := s.ackTimeout
 
 	// Close existing stream connection for this camera
 	if sc, ok := s.streamClients[deviceSN]; ok {
@@ -137,6 +162,9 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 
 	streamClient := p2p.NewClient(s.apiStation, dskKey, apiClient)
 	streamClient.SetRSAKey(rsaKey)
+	if discAttempts > 0 || ackTimeout > 0 {
+		streamClient.SetTimeouts(discAttempts, ackTimeout)
+	}
 
 	debuglog.Debugf("StartLivestream: connecting dedicated P2P for %s on channel %d", deviceSN, channel)
 
@@ -144,12 +172,12 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 		return fmt.Errorf("stream connect failed for %s: %w", deviceSN, err)
 	}
 
-	if !streamClient.WaitForConnection(30 * time.Second) {
+	if !streamClient.WaitForConnection(connTimeout) {
 		return fmt.Errorf("stream connection timeout for %s", deviceSN)
 	}
 	debuglog.Debugf("StartLivestream: P2P connected for %s, waiting for encryption", deviceSN)
 
-	if !streamClient.WaitForEncryption(15 * time.Second) {
+	if !streamClient.WaitForEncryption(encTimeout) {
 		return fmt.Errorf("stream encryption timeout for %s", deviceSN)
 	}
 	debuglog.Debugf("StartLivestream: encryption ready for %s", deviceSN)

@@ -29,6 +29,21 @@ local_port = 0
 #   2 = Quickest   — try LAN first, then fall back to cloud relay
 connection_type = 2
 
+# Timeouts for P2P connections (increase for internet/cloud relay paths).
+# All values in seconds unless noted.
+
+# How long to wait for a P2P connection to establish. Default: 60
+# connection_timeout = 60
+
+# How long to wait for encryption handshake after connecting. Default: 30
+# encryption_timeout = 30
+
+# Maximum number of discovery attempts (3s interval between each). Default: 30
+# discovery_attempts = 30
+
+# How long to wait for a command ACK before dropping it. Default: 15
+# ack_timeout = 15
+
 [auth]
 # Optional HTTP auth for the server's API endpoints.
 # type = "digest"    # enables digest auth (omit to disable)

@@ -200,20 +200,18 @@ func (s *Server) StreamPortHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
-	codec := mpegts.CodecH264
-	if strm.Codec == 2 {
-		codec = mpegts.CodecH265
-	}
-
-	muxer := mpegts.NewMuxer(w, codec)
-	defer muxer.Close()
+	var muxer *mpegts.Muxer
+	defer func() {
+		if muxer != nil {
+			muxer.Close()
+		}
+	}()
 
 	flusher, canFlush := w.(http.Flusher)
 	if canFlush {
 		flusher.Flush()
 	}
 
-	var ptsMs uint64
 	frameCount := 0
 	lastFrameID := 0
 
@@ -235,10 +233,16 @@ func (s *Server) StreamPortHandler(w http.ResponseWriter, r *http.Request) {
 			lastFrameID = nextID
 			if len(frames) > 0 {
 				for _, frame := range frames {
-					if err := muxer.WriteFrame(frame, ptsMs); err != nil {
+					if muxer == nil {
+						codec := mpegts.CodecH264
+						if strm.Codec == 2 {
+							codec = mpegts.CodecH265
+						}
+						muxer = mpegts.NewMuxer(w, codec)
+					}
+					if err := muxer.WriteFrame(frame.Data, frame.PTS); err != nil {
 						return
 					}
-					ptsMs += 66
 					frameCount++
 				}
 				if canFlush {
@@ -552,20 +556,18 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
-	codec := mpegts.CodecH264
-	if strm.Codec == 2 {
-		codec = mpegts.CodecH265
-	}
-
-	muxer := mpegts.NewMuxer(w, codec)
-	defer muxer.Close()
+	var muxer *mpegts.Muxer
+	defer func() {
+		if muxer != nil {
+			muxer.Close()
+		}
+	}()
 
 	flusher, canFlush := w.(http.Flusher)
 	if canFlush {
 		flusher.Flush()
 	}
 
-	var ptsMs uint64
 	frameCount := 0
 	lastFrameID := 0
 
@@ -576,7 +578,6 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-ticker.C:
-			// Re-check stream is still active (WS heartbeat controls lifecycle)
 			if stream.GetStream(deviceSN) == nil {
 				return
 			}
@@ -588,12 +589,15 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 			lastFrameID = nextID
 			if len(frames) > 0 {
 				for _, frame := range frames {
-					if err := muxer.WriteFrame(frame, ptsMs); err != nil { return }
-					ptsMs += 66
+					if muxer == nil {
+						codec := mpegts.CodecH264
+						if strm.Codec == 2 {
+							codec = mpegts.CodecH265
+						}
+						muxer = mpegts.NewMuxer(w, codec)
+					}
+					if err := muxer.WriteFrame(frame.Data, frame.PTS); err != nil { return }
 					frameCount++
-				}
-				if frameCount <= 5 {
-					debuglog.Debugf("StreamHandler: sent %d frames to %s (%d bytes total)", len(frames), deviceSN, frameCount)
 				}
 				if canFlush {
 					flusher.Flush()
@@ -737,11 +741,16 @@ func (s *Server) onVideoFrame(deviceSN string, frameData []byte, metadata p2p.Vi
 	return nil
 }
 
+
 func (s *Server) restartStaleStream(deviceSN string) {
 	strm := stream.GetStream(deviceSN)
 	if strm == nil {
 		return
 	}
+
+	strm.RestartMu.Lock()
+	defer strm.RestartMu.Unlock()
+
 	if !strm.IsStale() {
 		return
 	}
