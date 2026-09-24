@@ -31,6 +31,17 @@ const (
 	MaxStreamDataWait    = 5 * time.Second
 	MaxSequenceNumber    = 65535
 	SequenceBoundary     = 20000
+
+	// videoResyncThreshold is how long a sequence gap is tolerated (waiting for
+	// reordered packets to arrive) before we declare packet loss and resync.
+	// Must be long enough to absorb UDP reordering, short enough that a loss
+	// event is only a brief hiccup instead of a multi-second stall.
+	videoResyncThreshold = 250 * time.Millisecond
+	// maxQueuedVideoPackets caps the out-of-order video queue so memory and
+	// recovery time stay bounded no matter what the station sends.
+	maxQueuedVideoPackets = 1024
+	// maxVideoFrameBytes sanity-caps frame reassembly.
+	maxVideoFrameBytes = 8 * 1024 * 1024
 )
 
 type P2PConnectionType int
@@ -51,42 +62,43 @@ const (
 type CommandType uint16
 
 const (
-	CMD_START_REALTIME_MEDIA  CommandType = 1003
-	CMD_STOP_REALTIME_MEDIA   CommandType = 1004
-	CMD_SET_PAYLOAD           CommandType = 1350
-	CMD_DOORBELL_SET_PAYLOAD  CommandType = 1700
-	CMD_VIDEO_FRAME           CommandType = 1300
-	CMD_GATEWAYINFO           CommandType = 1100
-		CMD_PING                  CommandType = 1139
+	CMD_START_REALTIME_MEDIA CommandType = 1003
+	CMD_STOP_REALTIME_MEDIA  CommandType = 1004
+	CMD_SET_PAYLOAD          CommandType = 1350
+	CMD_DOORBELL_SET_PAYLOAD CommandType = 1700
+	CMD_VIDEO_FRAME          CommandType = 1300
+	CMD_GATEWAYINFO          CommandType = 1100
+	CMD_PING                 CommandType = 1139
 )
 
 type Client struct {
-	station   *api.Station
-	apiClient APICipherGetter
-	dskKey    string
-	conn      *net.UDPConn
-	localAddr *net.UDPAddr
+	station        *api.Station
+	apiClient      APICipherGetter
+	dskKey         string
+	conn           *net.UDPConn
+	localAddr      *net.UDPAddr
 	remoteAddr     *net.UDPAddr
 	connected      bool
 	connecting     bool
 	connectedReady chan struct{}
 
-	seqNumber       uint16
-	expectedSeqNo   [4]uint16
-	videoRoutes      map[byte]*videoRoute
-	videoStates      map[byte]*VideoFrameState
-	lastVideoChannel byte
+	seqNumber           uint16
+	expectedSeqNo       [4]uint16
+	seqInitialized      [4]bool
+	videoRoutes         map[byte]*videoRoute
+	videoStates         map[byte]*VideoFrameState
+	lastVideoChannel    byte
 	lastVideoPacketTime time.Time
 
-	encryption     EncryptionType
-	p2pKey         []byte
+	encryption      EncryptionType
+	p2pKey          []byte
 	encryptionReady chan struct{}
-	rsaKey         *rsa.PrivateKey
+	rsaKey          *rsa.PrivateKey
 
-	msgBuilder     [4]*MessageBuilder
-	msgState       [4]*MessageStateTracker
+	msgBuilder [4]*MessageBuilder
+	msgState   [4]*MessageStateTracker
 
-	sendQueue    []*QueuedMessage
+	sendQueue     []*QueuedMessage
 	messageStates map[uint16]*MessageState
 
 	turnHandshaking map[string]bool
@@ -118,11 +130,11 @@ type MessageBuilder struct {
 }
 
 type P2PDataHeader struct {
-	commandID  uint16
+	commandID   uint16
 	bytesToRead int
-	channel    byte
-	signCode   byte
-	dataType   byte
+	channel     byte
+	signCode    byte
+	dataType    byte
 }
 
 type MessageStateTracker struct {
@@ -144,9 +156,9 @@ type P2PMessage struct {
 }
 
 type QueuedMessage struct {
-	commandType     CommandType
-	channel         byte
-	payload         []byte
+	commandType CommandType
+	channel     byte
+	payload     []byte
 }
 
 type MessageState struct {
@@ -374,7 +386,6 @@ func (c *Client) sendGatewayInfo() {
 		debuglog.Debugf("P2P: gateway info send failed: %v", err)
 	}
 }
-
 
 func (c *Client) cloudLookup() {
 	addrs := c.getCloudAddresses()
@@ -721,94 +732,28 @@ func (c *Client) handleDataMessage(payload []byte, raddr *net.UDPAddr) {
 	}
 
 	if dataType == DataTypeVIDEO {
-		c.mu.Lock()
-		expectedSeq := c.expectedSeqNo[dtIdx]
-		c.mu.Unlock()
-
-		if seqNo == expectedSeq {
-			c.mu.Lock()
-			c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
-			c.mu.Unlock()
-			c.lastVideoPacketTime = time.Now()
-
-			c.processVideoPacket(seqNo, data)
-
-			// Drain queued video packets
-			ms := c.msgState[dtIdx]
-			for {
-				c.mu.Lock()
-				nextSeq := c.expectedSeqNo[dtIdx]
-				c.mu.Unlock()
-				queued, ok := ms.queuedData[int(nextSeq)]
-				if !ok {
-					break
-				}
-				c.mu.Lock()
-				c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
-				c.mu.Unlock()
-				c.processVideoPacket(queued.seqNo, queued.data)
-				delete(ms.queuedData, int(nextSeq))
-			}
-		} else {
-			ms := c.msgState[dtIdx]
-			ms.queuedData[int(seqNo)] = &P2PMessage{
-				dataType: dataType,
-				seqNo:    seqNo,
-				data:     data,
-			}
-
-			// Inline resync: if stuck for >2s, process queued packets directly
-			if !c.lastVideoPacketTime.IsZero() && time.Since(c.lastVideoPacketTime) > 2*time.Second {
-				for {
-					c.mu.Lock()
-					nextSeq := c.expectedSeqNo[dtIdx]
-					c.mu.Unlock()
-					queued, ok := ms.queuedData[int(nextSeq)]
-					if !ok {
-						if len(ms.queuedData) == 0 {
-							break
-						}
-						// Gap: skip to lowest queued seq
-						var lowest uint16
-						first := true
-						for k := range ms.queuedData {
-							s := uint16(k)
-							if first || isSeqBefore(s, lowest) {
-								lowest = s
-								first = false
-							}
-						}
-						c.mu.Lock()
-						c.expectedSeqNo[dtIdx] = lowest
-						for ch := range c.videoStates {
-							c.videoStates[ch] = &VideoFrameState{}
-						}
-						c.mu.Unlock()
-						continue
-					}
-					c.mu.Lock()
-					c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
-					c.mu.Unlock()
-					c.lastVideoPacketTime = time.Now()
-					c.processVideoPacket(queued.seqNo, queued.data)
-					delete(ms.queuedData, int(nextSeq))
-				}
-			}
-		}
+		c.handleVideoMessage(dtIdx, seqNo, data)
 	} else {
 		c.mu.Lock()
 		expectedSeq := c.expectedSeqNo[dtIdx]
+		initialized := c.seqInitialized[dtIdx]
 		c.mu.Unlock()
+
+		// Accept whatever sequence the station starts with.
+		if !initialized {
+			expectedSeq = seqNo
+		}
 
 		if seqNo == expectedSeq {
 			c.mu.Lock()
-			c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
+			c.seqInitialized[dtIdx] = true
+			c.expectedSeqNo[dtIdx] = incrementSequence(seqNo)
 			c.mu.Unlock()
 
 			msg := &P2PMessage{
-				dataType:   dataType,
-				seqNo:      seqNo,
-				data:       data,
+				dataType: dataType,
+				seqNo:    seqNo,
+				data:     data,
 			}
 			c.parseDataMessage(msg)
 
@@ -821,26 +766,159 @@ func (c *Client) handleDataMessage(payload []byte, raddr *net.UDPAddr) {
 				if !ok {
 					break
 				}
+				delete(ms.queuedData, int(nextSeq))
 				c.mu.Lock()
-				c.expectedSeqNo[dtIdx] = incrementSequence(c.expectedSeqNo[dtIdx])
+				c.expectedSeqNo[dtIdx] = incrementSequence(nextSeq)
 				c.mu.Unlock()
 				c.parseDataMessage(queued)
-				delete(ms.queuedData, int(nextSeq))
 			}
 		} else {
 			ms := c.msgState[dtIdx]
+			// Copy: data aliases the readLoop's reusable buffer.
 			ms.queuedData[int(seqNo)] = &P2PMessage{
-				dataType:   dataType,
-				seqNo:      seqNo,
-				data:       data,
+				dataType: dataType,
+				seqNo:    seqNo,
+				data:     append([]byte(nil), data...),
+			}
+			// Purge entries that can never be reached in order (stale replays).
+			for k := range ms.queuedData {
+				if isSeqBefore(uint16(k), expectedSeq) {
+					delete(ms.queuedData, k)
+				}
 			}
 		}
 	}
 }
 
+// handleVideoMessage implements loss-tolerant sequence handling for video packets.
+//
+//   - The first packet on a connection is accepted regardless of its seqNo.
+//   - In-order packets are processed immediately; reordered packets are queued
+//     briefly and drained in order.
+//   - If a gap is not filled within videoResyncThreshold (i.e. real packet loss,
+//     not reordering), we resync immediately: skip to the lowest queued seq,
+//     reset frame reassembly state, and keep flowing. A lost packet costs a
+//     dropped frame, not a multi-second stall.
+func (c *Client) handleVideoMessage(dtIdx int, seqNo uint16, data []byte) {
+	ms := c.msgState[dtIdx]
+	c.mu.Lock()
+	expected := c.expectedSeqNo[dtIdx]
+	initialized := c.seqInitialized[dtIdx]
+	c.mu.Unlock()
+
+	if !initialized {
+		// First video packet on this connection: adopt the station's seq.
+		debuglog.Debugf("P2P: video seq initialized to %d", seqNo)
+		c.mu.Lock()
+		c.seqInitialized[dtIdx] = true
+		c.expectedSeqNo[dtIdx] = seqNo
+		c.mu.Unlock()
+		expected = seqNo
+	}
+
+	if seqNo == expected {
+		c.processVideoInOrder(dtIdx, seqNo, data)
+		return
+	}
+
+	if isSeqBefore(seqNo, expected) {
+		// Duplicate or very late packet: already processed, drop it.
+		debuglog.Debugf("P2P: dropping duplicate video packet seq=%d expected=%d", seqNo, expected)
+		return
+	}
+
+	// Packet is ahead of expected: either reordering (gap will fill) or loss.
+	// IMPORTANT: data aliases the readLoop's reusable buffer, which is
+	// overwritten by the next UDP packet — it MUST be copied to be usable
+	// after this iteration.
+	ms.queuedData[int(seqNo)] = &P2PMessage{
+		dataType: DataTypeVIDEO,
+		seqNo:    seqNo,
+		data:     append([]byte(nil), data...),
+	}
+
+	if time.Since(c.lastVideoPacketTime) > videoResyncThreshold || len(ms.queuedData) > maxQueuedVideoPackets {
+		c.resyncVideoQueue(dtIdx)
+	}
+}
+
+// processVideoInOrder processes a packet and drains any queued packets that
+// now form a contiguous run.
+func (c *Client) processVideoInOrder(dtIdx int, seqNo uint16, data []byte) {
+	ms := c.msgState[dtIdx]
+
+	c.processVideoPacket(seqNo, data)
+	c.mu.Lock()
+	c.expectedSeqNo[dtIdx] = incrementSequence(seqNo)
+	c.mu.Unlock()
+
+	for {
+		c.mu.Lock()
+		next := c.expectedSeqNo[dtIdx]
+		c.mu.Unlock()
+		queued, ok := ms.queuedData[int(next)]
+		if !ok {
+			break
+		}
+		delete(ms.queuedData, int(next))
+		c.processVideoPacket(queued.seqNo, queued.data)
+		c.mu.Lock()
+		c.expectedSeqNo[dtIdx] = incrementSequence(next)
+		c.mu.Unlock()
+	}
+
+	c.lastVideoPacketTime = time.Now()
+}
+
+// resyncVideoQueue recovers from packet loss: skip the expected sequence to
+// the lowest queued packet, reset frame reassembly (continuity across the gap
+// is impossible), purge unreachable queue entries, and resume processing.
+func (c *Client) resyncVideoQueue(dtIdx int) {
+	ms := c.msgState[dtIdx]
+	if len(ms.queuedData) == 0 {
+		return
+	}
+
+	lowest := uint16(0)
+	first := true
+	for k := range ms.queuedData {
+		s := uint16(k)
+		if first || isSeqBefore(s, lowest) {
+			lowest = s
+			first = false
+		}
+	}
+
+	debuglog.Debugf("P2P: video seq resync dt=%d: skipping to seq=%d (%d queued, gap after %d)",
+		dtIdx, lowest, len(ms.queuedData), c.expectedSeqNo[dtIdx])
+
+	c.mu.Lock()
+	c.expectedSeqNo[dtIdx] = lowest
+	for ch := range c.videoStates {
+		c.videoStates[ch] = &VideoFrameState{}
+	}
+	c.mu.Unlock()
+
+	for k := range ms.queuedData {
+		if isSeqBefore(uint16(k), lowest) {
+			delete(ms.queuedData, k)
+		}
+	}
+
+	if queued, ok := ms.queuedData[int(lowest)]; ok {
+		delete(ms.queuedData, int(lowest))
+		c.processVideoInOrder(dtIdx, lowest, queued.data)
+		return
+	}
+
+	c.lastVideoPacketTime = time.Now()
+}
+
 func (c *Client) processVideoPacket(seqNo uint16, data []byte) {
+	hasHeader := len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord
+
 	var ch byte
-	if len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord {
+	if hasHeader {
 		ch = data[12]
 		c.lastVideoChannel = ch
 	} else {
@@ -855,13 +933,24 @@ func (c *Client) processVideoPacket(seqNo uint16, data []byte) {
 	}
 	c.mu.Unlock()
 
-	if len(data) >= P2PDataHeaderBytes && string(data[0:4]) == MagicWord {
+	if hasHeader {
+		if vs.bytesToRead > 0 && vs.bytesRead < vs.bytesToRead {
+			debuglog.Debugf("P2P: dropping incomplete video frame ch=%d (%d/%d bytes, missing packets)",
+				ch, vs.bytesRead, vs.bytesToRead)
+		}
+
 		header := P2PDataHeader{}
 		header.commandID = binary.LittleEndian.Uint16(data[4:6])
 		header.bytesToRead = int(binary.LittleEndian.Uint32(data[6:10]))
 		header.channel = data[12]
 		header.signCode = data[13]
 		header.dataType = data[14]
+
+		if header.bytesToRead <= 0 || header.bytesToRead > maxVideoFrameBytes {
+			debuglog.Debugf("P2P: invalid video frame size %d ch=%d, dropping", header.bytesToRead, ch)
+			return
+		}
+
 		videoData := data[P2PDataHeaderBytes:]
 		vs.header = header
 		vs.bytesToRead = header.bytesToRead
@@ -869,17 +958,36 @@ func (c *Client) processVideoPacket(seqNo uint16, data []byte) {
 		vs.frameBuf = make([]byte, len(videoData))
 		copy(vs.frameBuf, videoData)
 	} else if vs.bytesToRead > 0 {
+		// Continuation packet of the frame being reassembled.
+		if vs.bytesRead+len(data) > vs.bytesToRead {
+			// Overshoot means the stream position is desynced (e.g. a frame
+			// header packet was lost). Appending would emit a corrupted
+			// mixed-frame bitstream, so drop the frame entirely instead.
+			debuglog.Debugf("P2P: video frame overshoot ch=%d (%d+%d > %d), dropping frame",
+				ch, vs.bytesRead, len(data), vs.bytesToRead)
+			vs.frameBuf = nil
+			vs.bytesToRead = 0
+			vs.bytesRead = 0
+			return
+		}
 		vs.frameBuf = append(vs.frameBuf, data...)
 		vs.bytesRead += len(data)
+	} else {
+		// Continuation without an open frame (its header packet was lost).
+		return
 	}
+
 	if vs.bytesToRead > 0 && vs.bytesRead >= vs.bytesToRead {
-		c.handleVideoData(seqNo, vs.header, vs.frameBuf)
+		emitLen := vs.bytesToRead
+		if emitLen > len(vs.frameBuf) {
+			emitLen = len(vs.frameBuf)
+		}
+		c.handleVideoData(seqNo, vs.header, vs.frameBuf[:emitLen])
 		vs.frameBuf = nil
 		vs.bytesToRead = 0
 		vs.bytesRead = 0
 	}
 }
-
 
 func isSeqBefore(a, b uint16) bool {
 	diff := int(a) - int(b)
@@ -918,8 +1026,11 @@ func (c *Client) sendAckBuf(addr *net.UDPAddr, dataTypeBuffer []byte, seqNo uint
 	}
 }
 
+// incrementSequence advances a sequence number with natural uint16 wraparound
+// (0..65535 -> 0). The sequence space is 65536 values; using % 65535 would
+// permanently skip 65535 and stall/corrupt the stream once per wrap cycle.
 func incrementSequence(seq uint16) uint16 {
-	return (seq + 1) % MaxSequenceNumber
+	return seq + 1
 }
 
 // P2PDataHeaderBytes is the size of the inner P2P data header in received data.
@@ -951,7 +1062,8 @@ func (c *Client) parseDataMessage(message *P2PMessage) {
 
 		if firstPart {
 			if len(data) < P2PDataHeaderBytes {
-				ms.leftoverData = data
+				// Copy: data aliases the readLoop's reusable buffer.
+				ms.leftoverData = append([]byte(nil), data...)
 				break
 			}
 
@@ -972,14 +1084,15 @@ func (c *Client) parseDataMessage(message *P2PMessage) {
 				data = data[header.bytesToRead:]
 
 				if len(data) > 0 && len(data) <= P2PDataHeaderBytes {
-					ms.leftoverData = data
+					ms.leftoverData = append([]byte(nil), data...)
 					data = nil
 				}
 			} else {
 				if len(data) <= P2PDataHeaderBytes {
-					ms.leftoverData = data
+					ms.leftoverData = append([]byte(nil), data...)
 				} else {
-					builder.messages[int(message.seqNo)] = data
+					// Copy: reassembly may span multiple readLoop iterations.
+					builder.messages[int(message.seqNo)] = append([]byte(nil), data...)
 					builder.bytesRead = len(data)
 				}
 				data = nil
@@ -996,14 +1109,15 @@ func (c *Client) parseDataMessage(message *P2PMessage) {
 				data = data[remaining:]
 
 				if len(data) > 0 && len(data) <= P2PDataHeaderBytes {
-					ms.leftoverData = data
+					ms.leftoverData = append([]byte(nil), data...)
 					data = nil
 				}
 			} else {
 				if len(data) <= P2PDataHeaderBytes {
-					ms.leftoverData = data
+					ms.leftoverData = append([]byte(nil), data...)
 				} else {
-					builder.messages[int(message.seqNo)] = data
+					// Copy: reassembly may span multiple readLoop iterations.
+					builder.messages[int(message.seqNo)] = append([]byte(nil), data...)
 					builder.bytesRead += len(data)
 				}
 				data = nil
@@ -1121,7 +1235,8 @@ func (c *Client) handleCommandData(seqNo uint16, header P2PDataHeader, data []by
 // This is the encryption handshake that must complete before the station accepts commands.
 // Response format: [cipherID 2 LE][unknown 2][encryptedKey N bytes (null-terminated)]
 // Flow: extract cipherID → call API getCipher → if found: RSA decrypt key (LEVEL_2)
-//       → if not found: derive key from SN+p2pDid (LEVEL_1 fallback)
+//
+//	→ if not found: derive key from SN+p2pDid (LEVEL_1 fallback)
 func (c *Client) handleGatewayInfo(data []byte) {
 	if len(data) < 4 {
 		debuglog.Debugf("P2P: GATEWAYINFO response too short: %d bytes", len(data))
@@ -1229,10 +1344,7 @@ func (c *Client) SendCommand(commandType CommandType, channel byte, payload []by
 	c.mu.Lock()
 	remoteAddr := c.remoteAddr
 	seq := c.seqNumber
-	c.seqNumber++
-	if c.seqNumber > MaxSequenceNumber {
-		c.seqNumber = 0
-	}
+	c.seqNumber++ // uint16 wraps naturally through 65535 -> 0
 	c.mu.Unlock()
 
 	if remoteAddr == nil {
@@ -1309,10 +1421,7 @@ func (c *Client) executeSend(msg *QueuedMessage) {
 	c.mu.Lock()
 	remoteAddr := c.remoteAddr
 	seq := c.seqNumber
-	c.seqNumber++
-	if c.seqNumber > MaxSequenceNumber {
-		c.seqNumber = 0
-	}
+	c.seqNumber++ // uint16 wraps naturally through 65535 -> 0
 	c.mu.Unlock()
 
 	if remoteAddr == nil {

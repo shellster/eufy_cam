@@ -28,11 +28,31 @@ type StreamSession struct {
 	LastUpdate      int64
 	mu              sync.Mutex
 	RestartMu       sync.Mutex
+
+	// PTS rebasing: camera timestamps reset or jump whenever the P2P stream
+	// restarts. These fields force a strictly monotonic, session-relative PTS
+	// so the MPEG-TS output stays valid across restarts.
+	hasPTS     bool
+	lastRawPTS uint64
+	lastPTS    uint64
+	ptsOffset  uint64
+
+	// Corruption tracking: frames that fail validation are dropped and
+	// counted; a sustained run of bad frames triggers a P2P stream restart.
+	// seenValidFrame gates enforcement so an unproven camera format is served
+	// through (legacy behavior) instead of blackholing.
+	badFrames       int
+	totalBadFrames  int64
+	droppedFrames   int64
+	seenValidFrame  bool
+	awaitKeyframe   bool
+	noKeyFrameSince int64
+	lastRestartAt   int64
 }
 
 var (
 	streamIDCounter int64
-	activeStreams    = make(map[string]*StreamSession)
+	activeStreams   = make(map[string]*StreamSession)
 	streamsMutex    sync.RWMutex
 )
 
@@ -41,14 +61,17 @@ func StartStream(deviceSN, stationSN string, channel, codec int) *StreamSession 
 	defer streamsMutex.Unlock()
 
 	session := &StreamSession{
-		ID:          atomic.AddInt64(&streamIDCounter, 1),
-		DeviceSN:    deviceSN,
-		Station:     stationSN,
-		Channel:     channel,
-		Codec:       codec,
-		FrameBuffer: make([]TimedFrame, 0),
-		StartedAt:   time.Now().UnixMilli(),
-		LastUpdate:  time.Now().UnixMilli(),
+		ID:              atomic.AddInt64(&streamIDCounter, 1),
+		DeviceSN:        deviceSN,
+		Station:         stationSN,
+		Channel:         channel,
+		Codec:           codec,
+		FrameBuffer:     make([]TimedFrame, 0),
+		StartedAt:       time.Now().UnixMilli(),
+		LastUpdate:      time.Now().UnixMilli(),
+		lastKeyFrameIdx: -1,
+		awaitKeyframe:   true,
+		noKeyFrameSince: time.Now().UnixMilli(),
 	}
 
 	activeStreams[deviceSN] = session

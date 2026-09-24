@@ -76,16 +76,27 @@ func (s *Station) ConnectWithAPI(dskKey string, apiClient *api.Client) error {
 	s.mu.Unlock()
 
 	if err := p2pClient.Connect(); err != nil {
+		s.mu.Lock()
+		s.p2pClient = nil
+		s.mu.Unlock()
 		return err
 	}
 
 	debuglog.Debugf("Station %s: waiting for P2P connection...", s.GetSerial())
 	if !p2pClient.WaitForConnection(connTimeout) {
+		_ = p2pClient.Close()
+		s.mu.Lock()
+		s.p2pClient = nil
+		s.mu.Unlock()
 		return fmt.Errorf("station %s: P2P connection timeout", s.GetSerial())
 	}
 	debuglog.Debugf("Station %s: P2P connected, waiting for encryption...", s.GetSerial())
 
 	if !p2pClient.WaitForEncryption(encTimeout) {
+		_ = p2pClient.Close()
+		s.mu.Lock()
+		s.p2pClient = nil
+		s.mu.Unlock()
 		return fmt.Errorf("station %s: encryption setup timeout", s.GetSerial())
 	}
 	debuglog.Debugf("Station %s: encryption ready", s.GetSerial())
@@ -173,11 +184,13 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 	}
 
 	if !streamClient.WaitForConnection(connTimeout) {
+		_ = streamClient.Close()
 		return fmt.Errorf("stream connection timeout for %s", deviceSN)
 	}
 	debuglog.Debugf("StartLivestream: P2P connected for %s, waiting for encryption", deviceSN)
 
 	if !streamClient.WaitForEncryption(encTimeout) {
+		_ = streamClient.Close()
 		return fmt.Errorf("stream encryption timeout for %s", deviceSN)
 	}
 	debuglog.Debugf("StartLivestream: encryption ready for %s", deviceSN)

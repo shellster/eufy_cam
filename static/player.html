@@ -121,8 +121,13 @@
 			lastProgressTime = 0;
 			streamStartTime = 0;
 			if (retryCount > maxRetries) {
-				msgEl.textContent = 'Stream failed after ' + maxRetries + ' retries';
-				isRecovering = false;
+				// Don't give up permanently: pause, reset, and keep trying.
+				msgEl.innerHTML = `<span class="spinner"></span>Stream unstable - pausing 60s before retrying...`;
+				setTimeout(() => {
+					retryCount = 0;
+					isRecovering = false;
+					startStream().catch(e => console.error('startStream failed:', e));
+				}, 60000);
 				return;
 			}
 			const delay = getRetryDelay();

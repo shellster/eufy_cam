@@ -16,15 +16,12 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/shellster/eufy_cam/config"
 	"github.com/shellster/eufy_cam/pkg/api"
-	debuglog "github.com/shellster/eufy_cam/pkg/log"
 	"github.com/shellster/eufy_cam/pkg/devices"
+	debuglog "github.com/shellster/eufy_cam/pkg/log"
 	"github.com/shellster/eufy_cam/pkg/mpegts"
 	"github.com/shellster/eufy_cam/pkg/p2p"
 	"github.com/shellster/eufy_cam/pkg/stream"
 )
-
-
-
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
@@ -51,10 +48,10 @@ type Server struct {
 	staticFS  embed.FS
 	upgrader  websocket.Upgrader
 
-	mu              sync.RWMutex
-	loggedIn        bool
-	captcha         *api.CaptchaChallenge
-	onLoginSuccess  func()
+	mu             sync.RWMutex
+	loggedIn       bool
+	captcha        *api.CaptchaChallenge
+	onLoginSuccess func()
 }
 
 func NewServer(apiClient *api.Client, cfg *config.Config, staticFS embed.FS) *Server {
@@ -225,7 +222,7 @@ func (s *Server) StreamPortHandler(w http.ResponseWriter, r *http.Request) {
 			if stream.GetStream(deviceSN) == nil {
 				return
 			}
-			if time.Since(lastRestartCheck) > 10*time.Second && strm.IsStale() {
+			if time.Since(lastRestartCheck) > 2*time.Second && strm.NeedsRestart() {
 				lastRestartCheck = time.Now()
 				go s.restartStaleStream(deviceSN)
 			}
@@ -285,6 +282,12 @@ func (s *Server) startStreamForDevice(deviceSN string) error {
 		return fmt.Errorf("failed to start livestream: %v", err)
 	}
 
+	// StartLivestream blocks through P2P connect + camera warm-up; reset the
+	// staleness clock now so the monitor does not kill the fresh stream.
+	if strm := stream.GetStream(deviceSN); strm != nil {
+		strm.ResetLastUpdate()
+	}
+
 	log.Printf("Stream port: started livestream for %s on station %s", deviceSN, device.StationSN)
 	return nil
 }
@@ -321,8 +324,8 @@ func (s *Server) LoginStatusHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	writeJSON(w, map[string]bool{
-		"logged_in":         loggedIn,
-		"captcha_needed":   hasCaptcha && !loggedIn,
+		"logged_in":          loggedIn,
+		"captcha_needed":     hasCaptcha && !loggedIn,
 		"stations_connected": anyConnected,
 	})
 }
@@ -416,11 +419,11 @@ func (s *Server) LoginCaptchaDataHandler(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("Content-Type", "application/json")
 	writeJSON(w, map[string]interface{}{
-		"available":       true,
-		"item":            captcha.Item,
-		"captcha_base64":  captcha.CaptchaBase64,
-		"captcha_img":     captcha.CaptchaImg,
-		"captcha_url":     captcha.CaptchaURL,
+		"available":      true,
+		"item":           captcha.Item,
+		"captcha_base64": captcha.CaptchaBase64,
+		"captcha_img":    captcha.CaptchaImg,
+		"captcha_url":    captcha.CaptchaURL,
 	})
 }
 
@@ -530,12 +533,17 @@ func (s *Server) StartStreamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// StartLivestream blocks through P2P connect + camera warm-up; reset the
+	// staleness clock now so the monitor does not kill the fresh stream.
+	if strm := stream.GetStream(deviceSN); strm != nil {
+		strm.ResetLastUpdate()
+	}
+
 	debuglog.Debugf("Started livestream for device %s on station %s", deviceSN, device.StationSN)
 
 	w.Header().Set("Content-Type", "application/json")
 	writeJSON(w, map[string]string{"status": "started", "device_sn": deviceSN})
 }
-
 
 func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
@@ -581,7 +589,7 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 			if stream.GetStream(deviceSN) == nil {
 				return
 			}
-			if time.Since(lastRestartCheck) > 10*time.Second && strm.IsStale() {
+			if time.Since(lastRestartCheck) > 2*time.Second && strm.NeedsRestart() {
 				lastRestartCheck = time.Now()
 				go s.restartStaleStream(deviceSN)
 			}
@@ -596,7 +604,9 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 						}
 						muxer = mpegts.NewMuxer(w, codec)
 					}
-					if err := muxer.WriteFrame(frame.Data, frame.PTS); err != nil { return }
+					if err := muxer.WriteFrame(frame.Data, frame.PTS); err != nil {
+						return
+					}
 					frameCount++
 				}
 				if canFlush {
@@ -741,7 +751,11 @@ func (s *Server) onVideoFrame(deviceSN string, frameData []byte, metadata p2p.Vi
 	return nil
 }
 
-
+// restartStaleStream re-establishes the P2P livestream for a device when the
+// upstream feed is stale (no frames) or persistently corrupt. It performs a
+// full teardown and reconnect: StopLivestream closes the dedicated P2P
+// connection (also recovering from a dead/half-open UDP session) and
+// StartLivestream builds a fresh one.
 func (s *Server) restartStaleStream(deviceSN string) {
 	strm := stream.GetStream(deviceSN)
 	if strm == nil {
@@ -751,23 +765,50 @@ func (s *Server) restartStaleStream(deviceSN string) {
 	strm.RestartMu.Lock()
 	defer strm.RestartMu.Unlock()
 
-	if !strm.IsStale() {
+	// The session may have been replaced (e.g. by a player-driven restart)
+	// while we waited for the lock — never touch someone else's fresh stream.
+	current := stream.GetStream(deviceSN)
+	if current == nil || current.ID != strm.ID {
 		return
 	}
+
+	// Re-check under the restart lock: another goroutine may have just restarted.
+	if !strm.NeedsRestart() {
+		return
+	}
+
+	// Cooldown: avoid stacking reconnect attempts when the station is
+	// unreachable (each attempt can block for the full connect timeout).
+	if !strm.ShouldAttemptRestart() {
+		return
+	}
+	strm.MarkRestartAttempt()
 
 	station := devices.GetStation(strm.Station)
-	if station == nil || !station.IsConnected() {
+	if station == nil {
 		return
 	}
 
-	debuglog.Debugf("Restarting stale livestream for %s", deviceSN)
+	debuglog.Debugf("Restarting livestream for %s (stale=%v badFrames=%d)", deviceSN, strm.IsStale(), strm.BadFrameCount())
+
+	// Full teardown so a dead P2P session is replaced, not reused.
 	_ = station.StopLivestream(deviceSN, strm.Channel)
-	strm.ResetLastUpdate()
+	strm.ResetFailureTracking()
 	strm.ClearBuffer()
 
 	if err := station.StartLivestream(deviceSN, strm.Channel, strm.Codec, s.onVideoFrame); err != nil {
-		debuglog.Debugf("Failed to restart livestream for %s: %v", deviceSN, err)
+		// Leave LastUpdate in the past so the next check retries.
+		debuglog.Debugf("Failed to restart livestream for %s: %v (will retry)", deviceSN, err)
+		strm.MarkRestartFailed()
+		return
 	}
+
+	// Reset staleness ONLY after the reconnect finished: StartLivestream can
+	// block for the whole connect timeout, and battery cameras need several
+	// more seconds of warm-up before the first frame arrives. Resetting
+	// earlier makes the monitor kill the stream mid-warm-up in a loop.
+	strm.ResetLastUpdate()
+	debuglog.Debugf("Restarted livestream for %s, waiting for camera warm-up", deviceSN)
 }
 
 func (s *Server) stopLivestream(deviceSN string) {
