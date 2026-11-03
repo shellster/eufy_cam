@@ -25,21 +25,9 @@ func IsDebug() bool {
 	return debug
 }
 
-func Printf(format string, args ...interface{}) {
-	_ = logger.Output(2, fmt.Sprintf(format, args...))
-}
 
-func Println(args ...interface{}) {
-	_ = logger.Output(2, fmt.Sprintln(args...))
-}
 
-func Fatal(args ...interface{}) {
-	golog.Fatal(args...)
-}
 
-func Fatalf(format string, args ...interface{}) {
-	golog.Fatalf(format, args...)
-}
 
 func Debugf(format string, args ...interface{}) {
 	if !IsDebug() {

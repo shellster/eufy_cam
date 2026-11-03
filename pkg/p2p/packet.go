@@ -297,20 +297,6 @@ func isP2PCommandEncrypted(cmd CommandType) bool {
 	return encryptedCmds[cmd]
 }
 
-// BuildAck builds an ACK packet payload.
-func BuildAck(seq uint16, dataType P2PDataType) []byte {
-	header := DataTypeHeader[dataType]
-	numPending := make([]byte, 2)
-	binary.BigEndian.PutUint16(numPending, 1)
-	seqBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(seqBuf, seq)
-
-	result := make([]byte, 0)
-	result = append(result, header...)
-	result = append(result, numPending...)
-	result = append(result, seqBuf...)
-	return result
-}
 
 func NewUDPAddr() (*net.UDPAddr, error) {
 	return net.ResolveUDPAddr("udp", "0.0.0.0:0")

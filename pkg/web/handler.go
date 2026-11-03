@@ -1,16 +1,15 @@
 package web
 
 import (
+	"encoding/binary"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"strconv"
 	"sync"
 	"time"
@@ -184,8 +183,8 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/stations", s.ListStationsHandler).Methods("GET")
 	r.HandleFunc("/api/stream/start/{deviceSN}", s.StartStreamHandler).Methods("POST")
 	r.HandleFunc("/api/stream/stop/{deviceSN}", s.StopStreamHandler).Methods("POST")
-	r.HandleFunc("/api/stream/status/{deviceSN}", s.StreamStatusHandler).Methods("GET")
 	r.HandleFunc("/api/stream/{deviceSN}", s.StreamHandler).Methods("GET")
+	r.HandleFunc("/api/raw/{deviceSN}", s.RawStreamHandler).Methods("GET")
 	r.HandleFunc("/api/stream/ws/{deviceSN}", s.StreamWebSocketHandler)
 	r.HandleFunc("/stream/{deviceSN}", s.StreamPageHandler).Methods("GET")
 	sub, _ := fs.Sub(s.staticFS, "static")
@@ -205,8 +204,8 @@ func (s *Server) StreamPortHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Optional channel selection (multi-lens devices expose lens 2 as
-	// device_channel+1). Default -1 resolves to the device's primary channel.
+	// Optional channel selection. Default -1 resolves to the device's
+	// primary channel.
 	channelStr := r.URL.Query().Get("channel")
 	channel := -1
 	if channelStr != "" {
@@ -261,58 +260,24 @@ func (s *Server) serveStreamFrames(w http.ResponseWriter, r *http.Request, devic
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
-	// out is where muxed TS bytes go. For H.265 cameras it becomes an
-	// ffmpeg transcoder's stdin: browsers (MSE/mpegts.js) cannot decode
-	// HEVC, so H.265 is transcoded to H.264 on the fly for the web UI. The
-	// public stream port and the CLI keep the original H.265 bitstream for
-	// recorders like Frigate.
-	var out io.Writer = w
-	var closeTranscoder func()
-	startTranscoder := func() bool {
-		if _, err := exec.LookPath("ffmpeg"); err != nil {
-			log.Printf("%s: H.265 detected but ffmpeg not found - serving raw HEVC (browser may not play it)", label)
-			return false
+	// ptsBase: first PTS this connection served. Frames are remapped to
+	// (pts - ptsBase + 1000ms) so a viewer joining a long-running session
+	// gets timestamps starting near zero — MSE only decodes when currentTime
+	// is inside the buffered range, and session PTS grows for minutes.
+	var ptsBase uint64
+	havePTSBase := false
+	remapPTS := func(pts uint64) uint64 {
+		if !havePTSBase {
+			havePTSBase = true
+			ptsBase = pts
 		}
-		log.Printf("%s: H.265 detected for %s - transcoding to H.264 for web playback", label, deviceSN)
-		cmd := exec.Command("ffmpeg",
-			"-hide_banner", "-loglevel", "error",
-			"-i", "pipe:0",
-			"-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-			"-pix_fmt", "yuv420p",
-			"-f", "mpegts", "pipe:1",
-		)
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			log.Printf("%s: transcoder stdin failed: %v", label, err)
-			return false
-		}
-		cmd.Stdout = w
-		cmd.Stderr = nil
-		if err := cmd.Start(); err != nil {
-			log.Printf("%s: transcoder start failed: %v", label, err)
-			return false
-		}
-		done := make(chan struct{})
-		go func() { _ = cmd.Wait(); close(done) }()
-		out = stdin
-		closeTranscoder = func() {
-			_ = stdin.Close()
-			select {
-			case <-done:
-			case <-time.After(3 * time.Second):
-				_ = cmd.Process.Kill()
-			}
-		}
-		return true
+		return pts - ptsBase + 1000
 	}
 
 	var muxer *mpegts.Muxer
 	defer func() {
 		if muxer != nil {
 			muxer.Close()
-		}
-		if closeTranscoder != nil {
-			closeTranscoder()
 		}
 	}()
 
@@ -348,6 +313,10 @@ func (s *Server) serveStreamFrames(w http.ResponseWriter, r *http.Request, devic
 			}
 			frames, nextID := strm.GetFramesSince(lastFrameID)
 			lastFrameID = nextID
+			if frameCount == 0 && len(frames) == 0 && muxer == nil {
+				debuglog.Debugf("%s: %s ch=%d no frames yet (buffered=%d lastKF=%d awaitKF=%v)",
+					label, deviceSN, strm.Channel, strm.FrameCount(), strm.LastKeyFrameIdx(), strm.AwaitKeyframe())
+			}
 			if len(frames) > 0 {
 				for _, frame := range frames {
 					if muxer == nil {
@@ -355,14 +324,9 @@ func (s *Server) serveStreamFrames(w http.ResponseWriter, r *http.Request, devic
 						if strm.CurrentCodec() == 2 {
 							codec = mpegts.CodecH265
 						}
-						if codec == mpegts.CodecH265 && startTranscoder() {
-							// mux HEVC TS into the transcoder, not to the client
-							muxer = mpegts.NewMuxer(out, codec)
-						} else {
-							muxer = mpegts.NewMuxer(w, codec)
-						}
+						muxer = mpegts.NewMuxer(w, codec)
 					}
-					if err := muxer.WriteFrame(frame.Data, frame.PTS); err != nil {
+					if err := muxer.WriteFrame(frame.Data, remapPTS(frame.PTS)); err != nil {
 						return
 					}
 					frameCount++
@@ -373,6 +337,114 @@ func (s *Server) serveStreamFrames(w http.ResponseWriter, r *http.Request, devic
 			}
 		case <-r.Context().Done():
 			log.Printf("%s: client disconnected from %s after %d frames", label, deviceSN, frameCount)
+			return
+		}
+	}
+}
+
+// RawStreamHandler serves the session's Annex-B access units with a simple
+// [u32 LE length][payload] framing instead of MPEG-TS. This is the feed for
+// the H.265 camera player, which decodes HEVC in the browser via WASM
+// (hevc.js) and needs the raw AUs, not a TS container.
+func (s *Server) RawStreamHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	deviceSN := vars["deviceSN"]
+
+	channelStr := r.URL.Query().Get("channel")
+	channel := -1
+	if channelStr != "" {
+		if ch, err := strconv.Atoi(channelStr); err == nil {
+			channel = ch
+		}
+	}
+	if channel < 0 {
+		if device, err := s.findDevice(deviceSN); err == nil {
+			channel = device.Channel
+		}
+	}
+
+	if err := s.startStreamForDevice(deviceSN, channel); err != nil {
+		switch {
+		case errors.Is(err, errDeviceNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, errStationOffline), errors.Is(err, errStationNotFound):
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		default:
+			http.Error(w, "failed to start livestream", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	strm := stream.GetStream(deviceSN, channel)
+	if strm == nil {
+		http.Error(w, fmt.Sprintf("stream not found for device %s", deviceSN), http.StatusNotFound)
+		return
+	}
+
+	s.serveRawFrames(w, r, deviceSN, strm)
+}
+
+// serveRawFrames polls the session and writes framed Annex-B access units:
+// [u32 LE length][payload]. Payload is the same AU data the MPEG-TS path
+// would mux (Annex-B NALs, keyframe-aligned start).
+func (s *Server) serveRawFrames(w http.ResponseWriter, r *http.Request, deviceSN string, strm *stream.StreamSession) {
+	streamID := strm.ID
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, canFlush := w.(http.Flusher)
+	if canFlush {
+		flusher.Flush()
+	}
+
+	frameCount := 0
+	lastFrameID := 0
+
+	var lastRestartCheck time.Time
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	writeFrame := func(data []byte) error {
+		var hdr [4]byte
+		binary.LittleEndian.PutUint32(hdr[:], uint32(len(data)))
+		if _, err := w.Write(hdr[:]); err != nil {
+			return err
+		}
+		_, err := w.Write(data)
+		return err
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			cur := stream.GetStream(deviceSN, strm.Channel)
+			if cur == nil {
+				return
+			}
+			if cur.ID != streamID {
+				strm = cur
+				streamID = cur.ID
+				lastFrameID = 0
+			}
+			if time.Since(lastRestartCheck) > 2*time.Second && strm.NeedsRestart() {
+				lastRestartCheck = time.Now()
+				go s.restartStaleStream(deviceSN, strm.Channel)
+			}
+			frames, nextID := strm.GetFramesSince(lastFrameID)
+			lastFrameID = nextID
+			for _, frame := range frames {
+				if err := writeFrame(frame.Data); err != nil {
+					return
+				}
+				frameCount++
+			}
+			if len(frames) > 0 && canFlush {
+				flusher.Flush()
+			}
+		case <-r.Context().Done():
+			log.Printf("RawStream: client disconnected from %s after %d frames", deviceSN, frameCount)
 			return
 		}
 	}
@@ -406,18 +478,20 @@ func (s *Server) ensureStreamLocked(deviceSN string, channel int) error {
 		return fmt.Errorf("%w: %s", errStationOffline, device.StationSN)
 	}
 
-	// If this lens is already active and not stale, reuse it
+	// If this device's stream is already active and not stale, reuse it.
 	if strm := stream.GetStream(deviceSN, channel); strm != nil && !strm.IsStale() {
 		return nil
 	}
 
-	// A replaced session (e.g. stream started on a different channel) drops
-	// only its own lens; other lenses keep their sessions.
 	s.stopLivestream(deviceSN, channel)
 
 	stream.StartStream(deviceSN, station.GetSerial(), channel, int(p2p.VideoCodecH264))
 
-	if err := station.StartLivestream(deviceSN, channel, int(p2p.VideoCodecH264), s.onVideoFrame); err != nil {
+	// H264 is requested from every camera family, but the pan-tilt family
+	// (SoloCam S340/E42) streams H.265 regardless of the requested
+	// streamtype. The session detects the real codec from the frame
+	// headers, and the player picks the WASM decode path via the h265 flag.
+	if err := station.StartLivestream(deviceSN, channel, device.DeviceType, int(p2p.VideoCodecH264), s.onVideoFrame); err != nil {
 		_ = stream.StopStream(deviceSN, channel)
 		return fmt.Errorf("%w: %v", errLivestreamStart, err)
 	}
@@ -682,7 +756,8 @@ func (s *Server) StopStreamHandler(w http.ResponseWriter, r *http.Request) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	// No channel param: stop every lens of this device (legacy CLI behavior).
+	// No channel param: stop every active stream of this device (legacy
+	// CLI behavior).
 	if channels := stream.StreamChannelsForDevice(deviceSN); len(channels) == 0 {
 		writeJSON(w, map[string]string{"status": "not_active", "device_sn": deviceSN})
 		return
@@ -790,35 +865,6 @@ func (s *Server) StreamPageHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func (s *Server) StreamStatusHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	deviceSN := vars["deviceSN"]
-
-	w.Header().Set("Content-Type", "application/json")
-
-	strm := stream.GetStream(deviceSN, -1)
-	if strm == nil {
-		writeJSON(w, map[string]interface{}{
-			"active":     false,
-			"frameCount": 0,
-			"message":    "no stream session",
-		})
-		return
-	}
-
-	msg := "waiting for frames"
-	if strm.FrameCount() > 0 {
-		msg = "receiving frames"
-	}
-
-	writeJSON(w, map[string]interface{}{
-		"active":     true,
-		"frameCount": strm.FrameCount(),
-		"codec":      strm.CurrentCodec(),
-		"message":    msg,
-	})
-}
-
 func (s *Server) onVideoFrame(deviceSN string, channel byte, frameData []byte, metadata p2p.VideoFrameMetadata) error {
 	session := stream.GetStream(deviceSN, int(channel))
 	if session == nil {
@@ -873,7 +919,11 @@ func (s *Server) restartStaleStream(deviceSN string, channel int) {
 	strm.ResetFailureTracking()
 	strm.ClearBuffer()
 
-	if err := station.StartLivestream(deviceSN, strm.Channel, strm.CurrentCodec(), s.onVideoFrame); err != nil {
+	deviceType := 0
+	if device, err := s.findDevice(deviceSN); err == nil {
+		deviceType = device.DeviceType
+	}
+	if err := station.StartLivestream(deviceSN, strm.Channel, deviceType, int(p2p.VideoCodecH264), s.onVideoFrame); err != nil {
 		// Leave LastUpdate in the past so the next check retries.
 		debuglog.Debugf("Failed to restart livestream for %s: %v (will retry)", deviceSN, err)
 		strm.MarkRestartFailed()
@@ -917,7 +967,7 @@ func (s *Server) getCameraList() ([]CameraInfo, error) {
 			Model:      device.Model,
 			Channel:    device.Channel,
 			DeviceType: device.DeviceType,
-			Lenses:     devices.LensesForDeviceType(device.DeviceType),
+			H265:       devices.IsH265Camera(device.DeviceType),
 		})
 	}
 
@@ -965,7 +1015,7 @@ type CameraInfo struct {
 	Model      string `json:"model"`
 	Channel    int    `json:"channel"`
 	DeviceType int    `json:"device_type"`
-	Lenses     int    `json:"lenses"`
+	H265       bool   `json:"h265"`
 	Online     bool   `json:"online"`
 	Streaming  bool   `json:"streaming"`
 }

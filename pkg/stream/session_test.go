@@ -208,20 +208,26 @@ func TestClearBufferForcesKeyframeWait(t *testing.T) {
 	}
 }
 
-func TestClearBufferFallbackAfterTimeout(t *testing.T) {
+func TestNoMidGOPFallback(t *testing.T) {
 	s := newTestSession(t, "TEST-CLEAR-FALLBACK")
 
 	s.ClearBuffer()
 	appendNAL(s, false, 1000)
 
-	// If no keyframe ever arrives, serving resumes after the fallback window.
-	s.mu.Lock()
-	s.noKeyFrameSince = time.Now().Add(-noKeyFrameFallback - time.Second).UnixMilli()
-	s.mu.Unlock()
-
+	// NEVER serve mid-GOP frames when no keyframe exists: a client joining
+	// mid-GOP receives P-frames referencing frames it never saw, and the
+	// decoder renders gray skip-blocks with only motion fragments. Hold
+	// frames until a keyframe arrives instead — indefinitely.
 	frames, _ := s.GetFramesSince(0)
+	if len(frames) != 0 {
+		t.Fatalf("mid-GOP fallback served undecodable frames: got %d, want 0 (must wait for keyframe)", len(frames))
+	}
+
+	// Once a keyframe arrives, serving starts from it.
+	appendNAL(s, true, 2000)
+	frames, _ = s.GetFramesSince(0)
 	if len(frames) != 1 {
-		t.Fatalf("fallback did not resume serving: got %d frames, want 1", len(frames))
+		t.Fatalf("after keyframe arrival: got %d frames, want 1", len(frames))
 	}
 }
 

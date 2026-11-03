@@ -9,46 +9,32 @@
 		#views { display: flex; flex-direction: column; height: 100vh; }
 		video { width: 100%; object-fit: contain; display: block; background: #000; }
 		#views.single video { height: calc(100vh - 60px); }
-		#views.dual { gap: 2px; }
-		#views.dual .view-main video { height: 62vh; }
-		#views.dual .view-package video { height: calc(36vh - 2px); }
 		.overlay { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.8); padding: 8px 12px; z-index: 10; }
 		.overlay button { background: #fff; border: none; padding: 8px 16px; border-radius: 4px; font-weight: 600; cursor: pointer; margin-right: 8px; }
 		.overlay button:hover { background: #ddd; }
 		.message { color: #fff; margin-bottom: 8px; font-size: 14px; }
-		.debug { color: #888; font-size: 11px; margin-top: 4px; }
 		.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
 		@keyframes spin { to { transform: rotate(360deg); } }
-		.lens-tag { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.6); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; z-index: 5; }
 	</style>
 </head>
 <body>
 	<div id="views" class="single">
-		<div class="view-main" style="position: relative;">
-			<div class="lens-tag" id="tag-main">Camera</div>
+		<div class="view-main">
 			<video id="video-main" autoplay playsinline muted></video>
-		</div>
-		<div class="view-package" id="package-view" style="position: relative; display: none;">
-			<div class="lens-tag">Package Camera</div>
-			<video id="video-package" autoplay playsinline muted></video>
+			<canvas id="canvas-main" style="width:100%;display:none;background:#000"></canvas>
 		</div>
 	</div>
 
 	<div class="overlay">
 		<div class="message" id="message"><span class="spinner"></span>Connecting...</div>
-		<div class="debug" id="debug"></div>
 		<button onclick="window.location.href='/'">Back</button>
 	</div>
 
 	<script src="/static/mpegts.min.js"></script>
 	<script>
-		const params = new URLSearchParams(window.location.search);
-		const deviceSN = params.get('deviceSN') || window.location.pathname.split('/').pop();
-		const isDual = params.get('dual') === '1';
+		const deviceSN = window.location.pathname.split('/').pop();
 
 		const maxRetries = 10;
-		let views = [];
-		let isRecoveringViews = 0;
 
 		function getRetryDelay(count) {
 			return Math.min(2000 * Math.pow(2, count), 30000);
@@ -72,10 +58,10 @@
 		}
 
 		class PlayerView {
-			constructor(id, deviceSN, channel, videoEl, msgEl, isPrimary) {
+			constructor(id, deviceSN, videoEl, msgEl, isPrimary, isHevcCam) {
+				this.isHevcCam = isHevcCam || false;
 				this.id = id;
 				this.deviceSN = deviceSN;
-				this.channel = channel;
 				this.video = videoEl;
 				this.msgEl = msgEl;
 				this.isPrimary = isPrimary;
@@ -83,7 +69,6 @@
 				this.retryCount = 0;
 				this.isRecovering = false;
 				this.player = null;
-				this.statusInterval = null;
 				this.heartbeatWs = null;
 				this.heartbeatInterval = null;
 				this.stallCheckInterval = null;
@@ -94,21 +79,20 @@
 				this.onVideoError = null;
 			}
 
-			dbg(msg) {
-				if (this.isPrimary) {
-					document.getElementById('debug').textContent = `[main] ${msg}`;
-				}
-			}
-
 			setMsg(html) {
 				if (this.isPrimary) this.msgEl.innerHTML = html;
 			}
 
 			cleanup() {
 				if (this.stallCheckInterval) { clearInterval(this.stallCheckInterval); this.stallCheckInterval = null; }
-				if (this.statusInterval) { clearInterval(this.statusInterval); this.statusInterval = null; }
 				if (this.heartbeatInterval) { clearInterval(this.heartbeatInterval); this.heartbeatInterval = null; }
 				if (this.heartbeatWs) { this.heartbeatWs.onclose = null; this.heartbeatWs.close(); this.heartbeatWs = null; }
+				// Abort the raw-stream fetch first so its read loop dies,
+				// then tear down the WASM decoder. The recovery's fresh fetch
+				// re-serves from a keyframe AU, so a recreated decoder starts
+				// with a clean reference buffer.
+				if (this.h265Abort) { this.h265Abort.abort(); this.h265Abort = null; }
+				this.cleanupH265();
 				if (this.player) {
 					try { this.player.pause(); } catch(e) {}
 					try { this.player.unload(); } catch(e) {}
@@ -126,8 +110,8 @@
 				}
 			}
 
-			// teardown(): player-level failures escalate to a full P2P restart
-			// of this lens when the primary view hits its retry ceiling.
+			// Player-level failures escalate to a full P2P restart once the
+			// view hits its retry ceiling.
 			initiateRecovery(reason) {
 				if (this.isRecovering) return;
 				this.isRecovering = true;
@@ -154,7 +138,7 @@
 			startHeartbeat() {
 				const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 				this.heartbeatWs = new WebSocket(
-					`${wsProto}//${location.host}/api/stream/ws/${this.deviceSN}?channel=${this.channel}`);
+					`${wsProto}//${location.host}/api/stream/ws/${this.deviceSN}`);
 
 				this.heartbeatWs.onopen = () => {
 					this.heartbeatInterval = setInterval(() => {
@@ -172,16 +156,11 @@
 				};
 			}
 
-			async pollStatus() {
-				try {
-					const resp = await authFetch(`/api/stream/status/${this.deviceSN}`);
-					if (!resp) return;
-					const status = await resp.json();
-					this.dbg(`stream=${status.active} frames=${status.frameCount} codec=${status.codec} retries=${this.retryCount}`);
-				} catch (e) {}
-			}
-
 			async start() {
+				if (this.isHevcCam) {
+					await this.startH265();
+					return;
+				}
 				try {
 					if (typeof mpegts === 'undefined') {
 						this.setMsg('Error: mpegts.js failed to load');
@@ -192,11 +171,19 @@
 						return;
 					}
 
+					// H.265 cameras stream HEVC: MSE playback requires browser
+					// HEVC decode (hardware). Fail fast with a clear message
+					// instead of a silent black recovery loop.
+					if (this.isHevcCam && !MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L150.90"')) {
+						this.setMsg('This camera streams H.265 — this browser has no HEVC decoding (needs hardware HEVC). Try Safari, Edge, or Chrome with HEVC hardware support.');
+						return;
+					}
+
 					this.setMsg('<span class="spinner"></span>Establishing P2P connection...');
 
 					let startResp;
 					try {
-						startResp = await authFetch(`/api/stream/start/${this.deviceSN}?channel=${this.channel}`, { method: 'POST' });
+						startResp = await authFetch(`/api/stream/start/${this.deviceSN}`, { method: 'POST' });
 					} catch (e) {
 						console.error('Stream start request failed:', e);
 						this.initiateRecovery('start request failed: ' + e.message);
@@ -212,17 +199,25 @@
 
 					this.player = mpegts.createPlayer({
 						type: 'mpegts',
-						isLive: true,
-						url: `/api/stream/${this.deviceSN}?channel=${this.channel}`
+						// isLive stays FALSE even though this is a live feed:
+						// mpegts.js live mode discards data around the join
+						// point and, combined with the H.265 transcode's delayed
+						// first bytes, produces an init segment that never gets
+						// media samples (frozen frame + recovery loop). VOD-
+						// style consumption buffers and plays.
+						isLive: false,
+						url: `/api/stream/${this.deviceSN}`
 					}, {
+						// Verified working config for BOTH native camera H.264 and
+						// the H.265->H.264 transcode path. The extra buffering/
+						// cleanup flags (enableStashBuffer:false,
+						// autoCleanupSourceBuffer, lazyLoad:false) break the
+						// transcoded stream: mpegts.js parses the init segment
+						// but never appends media samples, and the player
+						// recovery-loops on a frozen frame.
 						enableWorker: false,
-						enableStashBuffer: false,
-						autoCleanupSourceBuffer: true,
-						lazyLoad: false,
 						liveBufferLatencyChasing: true,
-						liveBufferLatencyChasingOnPaused: true,
-						autoCleanupMaxBackwardDuration: 3,
-						autoCleanupMinBackwardDuration: 2
+						liveBufferLatencyChasingOnPaused: true
 					});
 
 					this.player.attachMediaElement(this.video);
@@ -264,55 +259,248 @@
 					this.streamStartTime = Date.now();
 					this.lastProgressTime = 0;
 					this.lastDecodedFrames = 0;
+					this.lastCurrentTime = -1;
+					this.lastProgressWall = Date.now();
 					this.setMsg('<span class="spinner"></span>Buffering...');
 
+					// Stall detection via the video element's currentTime:
+					// ground truth for "is video actually playing".
+					// mpegts.js STATISTICS_INFO decodedFrames does not advance
+					// for the H.265 transcode path and caused false recovery
+					// loops on a working stream.
 					this.stallCheckInterval = setInterval(() => {
 						if (!this.player || this.isRecovering) return;
 						const now = Date.now();
-						if (this.lastProgressTime === 0) {
-							if (now - this.streamStartTime > 15000) {
-								this.initiateRecovery('buffering timeout >15s');
-							}
+						const ct = this.video.currentTime;
+						const bufEnd = this.video.buffered.length ?
+							this.video.buffered.end(this.video.buffered.length - 1) : 0;
+
+						if (ct > this.lastCurrentTime + 0.04) {
+							// playback advancing: decoder producing frames
+							this.lastCurrentTime = ct;
+							this.lastProgressWall = now;
 							return;
 						}
-						if (now - this.lastProgressTime > 10000) {
-							this.initiateRecovery('no decode progress for 10s');
+
+						// Camera warming up (battery/solar sleep 10-30s+ after
+						// a stream request; server holds the session 40s):
+						// no data buffered yet — keep waiting, do not churn.
+						const waitingForWake = bufEnd === 0 && (now - this.streamStartTime) < 45000;
+						if (waitingForWake) return;
+
+						// currentTime frozen: decoder stalled on live data
+						if (now - this.lastProgressWall > 12000) {
+							this.initiateRecovery('playback stalled: currentTime frozen for 12s');
 						}
 					}, 3000);
 
 					this.startHeartbeat();
 
-					this.statusInterval = setInterval(() => this.pollStatus(), 5000);
-					this.pollStatus();
 				} catch (err) {
 					this.setMsg('Error: ' + err.message);
 				}
 			}
 		}
 
-		// Build views: single lens = one player; dual-lens devices (e.g. the
-		// E340 doorbell) show the main lens on top and the package lens below,
-		// mirroring the phone app's simultaneous two-lens display.
-		function buildViews() {
-			const viewsEl = document.getElementById('views');
+		// ---- H.265 camera player: WASM HEVC decode -> canvas ----
+		// For H.265 cameras the server streams raw Annex-B access units
+		// ([u32 len][au]) on /api/raw/{SN}, decoded in the browser by the
+		// hevc.js WASM decoder (works in any browser, no HEVC hardware or
+		// MSE-HEVC support needed).
+		Object.assign(PlayerView.prototype, {
+			async startH265() {
+				try {
+						// Load the emscripten glue as a classic script: it defines the
+					// global HEVCDecoderModule factory (importing it as an ES
+					// module fails - the glue is UMD/CommonJS-flavored and the
+					// namespace has no callable default).
+					if (!window.HEVCDecoderModule) {
+						await new Promise((res, rej) => {
+							const s = document.createElement('script');
+							s.src = '/static/hevcjs/wasm/hevc-decode.js';
+							s.onload = res;
+							s.onerror = () => rej(new Error('hevc wasm glue load failed'));
+							document.head.appendChild(s);
+						});
+					}
+					const mod = await import('/static/hevcjs/decoder-entry.js');
+					this.h265decFactory = mod;
+					this.h265dec = await mod.HEVCDecoder.create({});
+
+					this.canvas = document.getElementById('canvas-main');
+					this.canvas.style.display = 'block';
+					document.getElementById('video-main').style.display = 'none';
+					this.ctx2d = this.canvas.getContext('2d');
+					this.lastRenderWall = Date.now();
+
+					this.setMsg('<span class="spinner"></span>Establishing P2P connection...');
+
+					const ctl = new AbortController();
+					this.h265Abort = ctl;
+					let startResp;
+					try {
+						startResp = await authFetch(`/api/raw/${this.deviceSN}`, { signal: ctl.signal });
+					} catch (e) {
+						this.initiateRecovery('raw stream request failed: ' + e.message);
+						return;
+					}
+					if (!startResp || !startResp.ok) {
+						this.setMsg('Raw stream error: ' + (startResp ? startResp.status : 'no response'));
+						return;
+					}
+
+					this.startHeartbeat();
+
+				const reader = startResp.body.getReader();
+				let acc = new Uint8Array(0);
+
+					// An AU that carries VPS/SPS/PPS begins a new encoding
+					// session (camera wake, resolution ramp, stream restart).
+					// P-frames from the new session reference pictures that do
+					// not exist in the old decoder's DPB, and every frame after
+					// the switch decodes as gray skip-blocks until the decoder
+					// is rebuilt. Reset the decoder whenever a fresh param-set
+					// AU shows up after we have already decoded something.
+					const auStartsNewSession = (au) => {
+						let sawSlice = false;
+						for (let i = 0; i + 3 < au.length; i++) {
+							if (au[i] === 0 && au[i+1] === 0 && au[i+2] === 1) {
+								const t = (au[i+3] >> 1) & 0x3F;
+								if (t === 32 || t === 33) return !sawSlice && true;
+								if (t <= 31) sawSlice = true;
+							}
+						}
+						return false;
+					};
+					let decodedAny = false;
+					let resetting = false;
+					const resetDecoder = async () => {
+						if (resetting) return;
+						resetting = true;
+						try { this.h265dec.destroy(); } catch (e) {}
+						this.h265dec = await this.h265decFactory.HEVCDecoder.create({});
+						resetting = false;
+					};
+
+					const processAU = async (au) => {
+						if (decodedAny && auStartsNewSession(au)) {
+							await resetDecoder();
+						}
+						try { this.h265dec.feed(au); } catch (e) {}
+						const frames = this.h265dec.drain();
+						if (frames.length) {
+							const f = frames[frames.length - 1];
+							this.renderHEVCFrame(f);
+							decodedAny = true;
+							this.lastRenderWall = Date.now();
+						}
+					};
+
+					const processBuffer = async () => {
+						// parse as many framed AUs as available — sequentially, so
+						// a decoder reset never overlaps with the AU that must
+						// seed the fresh decoder (its own IDR/param-set AU)
+						while (acc.length >= 4) {
+							const len = acc[0] | (acc[1] << 8) | (acc[2] << 16) | (acc[3] << 24);
+							if (len <= 0 || len > 16 * 1024 * 1024) {
+								// corrupt framing — resync by dropping one byte
+								acc = acc.slice(1);
+								continue;
+							}
+							if (acc.length < 4 + len) return;
+							const au = acc.slice(4, 4 + len);
+							acc = acc.slice(4 + len);
+							await processAU(au);
+						}
+					};
+
+					const feedLoop = async () => {
+						try {
+							while (true) {
+								const {done, value} = await reader.read();
+								if (done) { this.setMsg('Stream ended'); return; }
+								if (value && value.length) {
+									const merged = new Uint8Array(acc.length + value.length);
+									merged.set(acc); merged.set(value, acc.length);
+									acc = merged;
+									await processBuffer();
+								}
+							}
+						} catch (e) { /* aborted */ }
+					};
+					feedLoop();
+
+					this.setMsg('');
+					// recovery loop for this mode: if frames stop rendering for 15s
+					const stall = setInterval(() => {
+						if (Date.now() - this.lastRenderWall > 15000) {
+							clearInterval(stall);
+							this.initiateRecovery('h265 decode stalled 15s');
+						}
+					}, 3000);
+					this.h265StallInterval = stall;
+				} catch (err) {
+					this.setMsg('H265 error: ' + err.message);
+				}
+			},
+
+			renderHEVCFrame(f) {
+				const w = f.width, h = f.height, cw = f.chromaWidth;
+				const y = f.y, cb = f.cb, cr = f.cr;
+				const is10 = f.bitDepth === 10;
+				if (!this.imgData || this.imgData.width !== w || this.imgData.height !== h) {
+					this.canvas.width = w; this.canvas.height = h;
+					this.imgData = this.ctx2d.createImageData(w, h);
+				}
+				const px = this.imgData.data;
+				let di = 0;
+				for (let row = 0; row < h; row++) {
+					const yrow = row * w;
+					const crow = (row >> 1) * cw;
+					for (let col = 0; col < w; col++) {
+						const Y = is10 ? (y[yrow + col] >> 2) : y[yrow + col];
+						const ci = crow + (col >> 1);
+						const U = (is10 ? (cb[ci] >> 2) : cb[ci]) - 128;
+						const V = (is10 ? (cr[ci] >> 2) : cr[ci]) - 128;
+						px[di]     = Y + 1.402 * V;
+						px[di + 1] = Y - 0.344 * U - 0.714 * V;
+						px[di + 2] = Y + 1.772 * U;
+						px[di + 3] = 255;
+						di += 4;
+					}
+				}
+				this.ctx2d.putImageData(this.imgData, 0, 0);
+			},
+
+			cleanupH265() {
+				if (this.h265StallInterval) { clearInterval(this.h265StallInterval); this.h265StallInterval = null; }
+				if (this.h265dec) { try { this.h265dec.destroy(); } catch (e) {} this.h265dec = null; }
+				if (this.canvas) { this.canvas.style.display = 'none'; }
+				if (document.getElementById('video-main')) { document.getElementById('video-main').style.display = ''; }
+			},
+		});
+
+		// The server's device list decides the pipeline: H.264 cameras play
+		// via MSE/mpegts.js, H.265 cameras via the WASM decoder. No query
+		// parameters — the server resolves the device's channel too.
+		(async () => {
+			let cam = null;
+			try {
+				const resp = await authFetch('/api/cameras');
+				if (resp && resp.ok) {
+					const cameras = await resp.json();
+					cam = cameras.find(c => c.device_sn === deviceSN) || null;
+				}
+			} catch (e) { /* fall through to error below */ }
 			const msgEl = document.getElementById('message');
-			const mainChannel = parseInt(params.get('channel') || '0', 10);
-			const list = [new PlayerView('main', deviceSN, mainChannel,
-				document.getElementById('video-main'), msgEl, true)];
-
-			if (isDual) {
-				viewsEl.classList.remove('single');
-				viewsEl.classList.add('dual');
-				document.getElementById('package-view').style.display = 'block';
-				document.getElementById('tag-main').textContent = 'Main Camera';
-				list.push(new PlayerView('package', deviceSN, mainChannel + 1,
-					document.getElementById('video-package'), msgEl, false));
+			if (!cam) {
+				msgEl.textContent = 'Unknown camera: ' + deviceSN;
+				return;
 			}
-			return list;
-		}
-
-		views = buildViews();
-		views.forEach(v => v.start().catch(e => console.error('start failed:', e)));
+			const view = new PlayerView('main', deviceSN,
+				document.getElementById('video-main'), msgEl, true, !!cam.h265);
+			view.start().catch(e => console.error('start failed:', e));
+		})();
 	</script>
 </body>
 </html>

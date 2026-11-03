@@ -59,17 +59,11 @@ func IsBatteryDoorbellDual(deviceType int) bool {
 		deviceType == DeviceTypeBatteryDoorbellC30
 }
 
-// LensesForDeviceType returns how many simultaneous P2P video channels the
-// device exposes for live viewing.
-//
-// IMPORTANT (verified live against a real account): multi-lens cameras like
-// the Battery Doorbell Plus E340 deliver BOTH lenses composited into a single
-// portrait stream on device_channel (1600x2200 = main lens + package lens
-// stacked). Requesting device_channel+1 on a HomeBase-managed device grabs
-// the NEXT DEVICE's slot on that homebase (e.g. the neighboring camera's
-// feed) — it is NOT a second lens. Never add +1 channels for HomeBase-managed
-// devices. Standalone (non-HomeBase) dual-lens installs may expose channel+1;
-// only enable that if observed.
-func LensesForDeviceType(deviceType int) int {
-	return 1
+
+// IsH265Camera reports whether the camera streams H.265/HEVC natively
+// (verified live: SoloCam S340 + E42 pan-tilt emit H.265; eufyCam 3C and the
+// battery doorbells emit H.264). Web playback of these requires a browser
+// with HEVC hardware decode.
+func IsH265Camera(deviceType int) bool {
+	return IsOutdoorPanTiltCamera(deviceType) || IsIndoorPanTiltCamera(deviceType)
 }

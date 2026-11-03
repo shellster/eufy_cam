@@ -121,17 +121,26 @@ Detect the codec from `metadata.StreamType` FIRST (authoritative), falling
 back to NAL-header sniffing (`GetVideoCodec`) which must handle both 1-byte
 H.264 NAL headers and 2-byte HEVC NAL headers (VPS=32/SPS=33/PPS=34/AUD=35).
 
+### The isKeyFrame header byte is NOT reliable
+
+Pan-tilt cameras (SoloCam S340/E42) never set the `isKeyFrame` flag in the
+frame header, even for real IDR frames. Keyframe detection must scan the
+AU's NALs for IDR/CRA (HEVC nal types 19/20/21, H.264 type 5) — and it must
+walk ALL NALs: keyframe AUs lead with VPS/SPS/PPS/SEI before the IDR slice,
+so checking only the first NAL sees the VPS and misses every keyframe.
+Without this, keyframe-gated serving starves and clients join mid-GOP.
+
 ## Multi-Lens Devices
 
-Dual-lens devices stream one lens per channel over the same P2P session
-- verified live on the Battery Doorbell Plus E340 (T8214):
-  - main lens    = `device_channel`     (1600x2200 portrait)
-  - package lens = `device_channel + 1` (wide, resolution adapts 1080p/1296p)
-- both lenses stream SIMULTANEOUSLY over one shared P2P connection; a start
-  command on channel N+1 must NOT tear down the existing session
-- NOTE: the SoloCam S340 does NOT expose a lens on channel+1 when managed by
-  a HomeBase (channel+1 yields no frames) — only the doorbell family is
-  dual-lens per channel.
+HomeBase channel slots are DEVICE slots, not lens slots. This was verified
+with packet-level content fingerprinting: requesting `device_channel + 1`
+delivers the NEXT DEVICE's feed (96/100 TS packets matched the neighbor
+camera), not a second lens.
+
+Multi-lens cameras deliver ALL lenses composited in ONE stream on the
+device's own channel — verified on the Battery Doorbell Plus E340 (T8214):
+a single portrait 1600x2200 stream = main lens with the package lens view
+stacked below. NEVER add +1 channel starts for a second lens.
 
 The P2P layer routes frames per channel (`videoRoutes[channel]`), so the
 stream callback carries the channel and sessions are keyed `deviceSN#channel`.
@@ -146,32 +155,49 @@ stream callback carries the channel and sessions are keyed `deviceSN#channel`.
   a loop and the camera never finishes waking - the web app then never shows
   video.
 - These cameras stream H.265 (`frame streamType=1`). Browsers cannot decode
-  HEVC via MSE, so the web/`/api/stream` path pipes the TS through ffmpeg
-  (libx264 zerolatency) to transcode H.265 -> H.264 on the fly. DO NOT pass
-  `-fflags +nobuffer` to ffmpeg for a pipe input: with it, ffmpeg emits zero
-  bytes for a live MPEG-TS pipe (format probing never completes). Recorders
-  (Frigate) can also consume this transcoded stream.
+  HEVC via MSE, so the web player uses the `/api/raw/{SN}` endpoint (framed
+  Annex-B AUs) with the vendored hevc.js WASM decoder rendering to a canvas —
+  works in every browser, no transcode step and no ffmpeg anywhere.
 - Rapid successive stream requests can put battery cameras in a temporary
   refuse state: if a camera stops responding to stream requests, stop the
   stream, wait ~60s, and re-request.
 
-## Sequence Loss Resync (CRITICAL for remote/relayed stations)
+## Sequence Gap Handling (CRITICAL — verified against live logs)
 
-Video packets are sequenced. When a packet is LOST, the station go-back-N
-retransmits the PRECEDING packet forever. Those retransmits arrive as
-"duplicates" (seq < expected) and keep the connection's packet-arrival clock
-fresh - so a resync keyed on packet ARRIVALS never fires and the pipeline
-stalls permanently (symptom: one frame at stream start / after each monitor
-restart, camera OSD clock frozen, player recovery-loop forever; remote
-relayed homebases lose packets constantly, local ones rarely).
+Video packets are sequenced per dataType. The station runs a go-back-N
+retransmit: whenever a packet's per-packet ACK is missing (packet lost OR the
+ACK itself lost), it re-bursts its whole un-ACKed window. That means:
 
-The resync must be driven by LACK OF PROGRESS (`lastVideoAdvance` = when the
-expected sequence last moved forward), triggered from the duplicate-drop path:
-after `videoResyncThreshold` without an advance (or 3 consecutive duplicate
-drops), skip to the lowest queued packet; if nothing is queued, advance
-expected past the retransmitted packet and reset frame reassembly. NEVER move
-`expectedSeqNo` backward - after an earlier resync skipped ahead, a stale
-retransmit arriving later must not regress it.
+- **Duplicates are normal and healthy.** A re-burst delivers 10+ consecutive
+  duplicates of already-received packets while the ONE genuinely missing
+  packet is still in flight. Measured on the relayed path: the retransmit of
+  the missing seq arrives up to ~2.7s (81 packets) after the gap opened.
+- **NEVER skip a gap on duplicate streaks.** Skipping forward discards the
+  in-flight retransmit when it lands (observed in logs: resync skipped seq N,
+  then `dropping duplicate video packet seq=N` arrived 81 packets later).
+  Every skip manufactures a permanent hole: the AU reassembles with missing
+  bytes, the HEVC reference chain breaks ("Could not find ref with POC"),
+  and the picture decodes as gray skip-blocks with only motion fragments
+  visible until the next keyframe. THIS WAS THE ROOT CAUSE of the months-long
+  "95% gray" H.265 playback bug.
+- **Hold gaps open** (`videoResyncThreshold = 4s`, > measured retransmit
+  latency): packets ahead of the gap are queued; when the retransmit arrives,
+  the queue drains strictly in order and the frame reassembles intact. The
+  cost of a real loss is a brief freeze, not corruption.
+- **ACK every received packet** (`handleDataMessage` ACKs before seq
+  handling, including duplicates) — that is what slides the station's
+  retransmit window and stops the re-bursts.
+- Only after the 4s hold expires with no fill (true loss): resync to the
+  LOWEST QUEUED packet (`resyncVideoQueue`), reset frame reassembly, and let
+  the keyframe-gated serve heal the decode chain. NEVER move
+  `expectedSeqNo` backward.
+
+The protocol's full-featured transport layer implements this same contract
+via NACK/SACK control packets (uTP pt=2, RTCP-style PID+BLP chunks, u64 BE
+una_seq), retransmit history, FEC, and drop-until-keyframe recovery. Our Go
+client speaks the legacy protocol, where the equivalent feedback is per-packet
+ACKs + the station's go-back-N — the rules above are how to be a well-behaved
+legacy receiver.
 
 ## ACK Handling
 

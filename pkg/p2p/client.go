@@ -26,11 +26,18 @@ const (
 	MaxSequenceNumber = 65535
 	HeartbeatInterval = 3 * time.Second
 
-	// videoResyncThreshold is how long a sequence gap is tolerated (waiting for
-	// reordered packets to arrive) before we declare packet loss and resync.
-	// Must be long enough to absorb UDP reordering, short enough that a loss
-	// event is only a brief hiccup instead of a multi-second stall.
-	videoResyncThreshold = 250 * time.Millisecond
+	// videoResyncThreshold is how long a sequence gap is held open while
+	// waiting for the station's go-back-N retransmit to fill it. Measured on
+	// the relayed path: the station retransmits a lost packet up to ~2.7s
+	// after the gap opened (81 packets later), and it keeps re-bursting the
+	// un-ACKed window until the per-packet ACK arrives — both sides already
+	// speak that contract (every received packet is ACKed, including
+	// duplicates). Skipping a gap early converts a recoverable delay into a
+	// permanent hole: the frame reassembles with missing bytes, the decoder's
+	// reference chain breaks, and the picture goes gray until the next
+	// keyframe. So hold the gap far longer than the retransmit latency; the
+	// cost of a real loss is a brief freeze instead of corruption.
+	videoResyncThreshold = 4 * time.Second
 	// maxQueuedVideoPackets caps the out-of-order video queue so memory and
 	// recovery time stay bounded no matter what the station sends.
 	maxQueuedVideoPackets = 1024
@@ -83,14 +90,6 @@ type Client struct {
 	videoStates         map[byte]*VideoFrameState
 	lastVideoChannel    byte
 	lastVideoPacketTime time.Time
-	// lastVideoAdvance is when the expected sequence number LAST advanced.
-	// Loss resync must be driven by lack of progress, not by packet arrivals:
-	// after a lost packet the station retransmits its predecessor forever, and
-	// those duplicates keep lastVideoPacketTime fresh, which previously
-	// prevented the resync from ever firing (permanent stall on any lossy /
-	// relayed connection).
-	lastVideoAdvance    time.Time
-	duplicateStreak     int
 
 	encryption      EncryptionType
 	p2pKey          []byte
@@ -222,6 +221,18 @@ func (c *Client) Connect() error {
 	if err != nil {
 		c.connecting = false
 		return fmt.Errorf("failed to listen UDP: %w", err)
+	}
+
+	// Eufy cameras emit keyframes as a single back-to-back UDP burst
+	// (~290KB for a 1440p keyframe). The default kernel receive buffer
+	// (~212KB) is smaller than one burst, so the tail of every keyframe was
+	// being dropped by the kernel before this process ever read it — the
+	// direct cause of broken/gray decodes on these cameras. 4MB comfortably
+	// holds a full keyframe burst plus normal inter-frame traffic. This is a
+	// per-socket option set in userspace (SO_RCVBUF via the Go net API) —
+	// no system configuration is touched.
+	if err := conn.SetReadBuffer(4 * 1024 * 1024); err != nil {
+		debuglog.Debugf("P2P: SetReadBuffer failed (non-fatal): %v", err)
 	}
 
 	c.conn = conn
@@ -824,41 +835,15 @@ func (c *Client) handleVideoMessage(dtIdx int, seqNo uint16, data []byte) {
 	}
 
 	if isSeqBefore(seqNo, expected) {
-		// Duplicate or very late packet: already processed, drop it.
+		// Duplicate or very late packet: already processed (or queued), drop
+		// it. Its ACK already went out in handleDataMessage — that is what
+		// slides the station's go-back-N window and stops the re-burst. Do
+		// NOT treat duplicates as evidence that `expected` is lost: a go-back-N
+		// re-burst delivers 10+ consecutive duplicates of already-delivered
+		// packets while the ONE genuinely missing packet is still in flight
+		// (observed arriving ~2.7s later). Skipping forward here discards
+		// that retransmit and manufactures the very hole it was meant to heal.
 		debuglog.Debugf("P2P: dropping duplicate video packet seq=%d expected=%d", seqNo, expected)
-
-		// LOSS RESYNC: a duplicate means the station is stuck in go-back-N
-		// retransmit because the packet we EXPECT was lost. Duplicates keep
-		// arriving forever (and keep lastVideoPacketTime fresh), so the
-		// ahead-of-gap resync below never fires — resync on lack of progress
-		// here instead, or the pipeline stalls until the stale monitor kills
-		// the whole stream (observed on relayed/remote connections).
-		c.duplicateStreak++
-		if time.Since(c.lastVideoAdvance) > videoResyncThreshold || c.duplicateStreak >= 3 {
-			debuglog.Debugf("P2P: video loss resync dt=%d (expected=%d, dup streak=%d)",
-				dtIdx, expected, c.duplicateStreak)
-			c.lastVideoAdvance = time.Now()
-			c.duplicateStreak = 0
-
-			// Skip to any queued-ahead packets first (they are real data).
-			c.resyncVideoQueue(dtIdx)
-
-			// If nothing is queued, abandon the lost packet so the next
-			// fresh packet from the station is accepted. Frame reassembly
-			// resets: continuity across the gap is impossible anyway.
-			// NEVER move expected backward: after an earlier resync already
-			// skipped ahead, a stale duplicate must not regress it.
-			c.mu.Lock()
-			next := incrementSequence(seqNo)
-			if c.expectedSeqNo[dtIdx] == expected && isSeqBefore(c.expectedSeqNo[dtIdx], next) {
-				c.expectedSeqNo[dtIdx] = next
-				for ch := range c.videoStates {
-					c.videoStates[ch] = &VideoFrameState{}
-				}
-				debuglog.Debugf("P2P: advanced past lost packet to seq=%d", next)
-			}
-			c.mu.Unlock()
-		}
 		return
 	}
 
@@ -903,8 +888,6 @@ func (c *Client) processVideoInOrder(dtIdx int, seqNo uint16, data []byte) {
 	}
 
 	c.lastVideoPacketTime = time.Now()
-	c.lastVideoAdvance = time.Now()
-	c.duplicateStreak = 0
 }
 
 // resyncVideoQueue recovers from packet loss: skip the expected sequence to

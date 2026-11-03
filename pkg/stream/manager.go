@@ -41,22 +41,18 @@ type StreamSession struct {
 	// seenValidFrame gates enforcement so an unproven camera format is served
 	// through (legacy behavior) instead of blackholing.
 	badFrames       int
-	totalBadFrames  int64
-	droppedFrames   int64
 	seenValidFrame  bool
 	everHadFrame    bool
 	awaitKeyframe   bool
-	noKeyFrameSince int64
 	lastRestartAt   int64
 }
 
 var (
 	streamIDCounter int64
-	// activeStreams is keyed by "deviceSN#channel" so multi-lens devices
-	// (e.g. Battery Doorbell Plus E340: main lens + package lens on adjacent
-	// channels) can stream both views simultaneously.
-	activeStreams   = make(map[string]*StreamSession)
-	streamsMutex    sync.RWMutex
+	// activeStreams is keyed by "deviceSN#channel" (one session per
+	// device channel).
+	activeStreams = make(map[string]*StreamSession)
+	streamsMutex  sync.RWMutex
 )
 
 // streamKey builds the session map key for a device channel.
@@ -70,8 +66,8 @@ func StartStream(deviceSN, stationSN string, channel, codec int) *StreamSession 
 
 	key := streamKey(deviceSN, channel)
 	if existing, ok := activeStreams[key]; ok && !existing.isStaleLocked() {
-		// Reuse the live session instead of replacing it (a second viewer on
-		// the same lens must not reset the frame buffer mid-GOP).
+		// Reuse the live session instead of replacing it (a second viewer
+		// must not reset the frame buffer mid-GOP).
 		return existing
 	}
 
@@ -86,7 +82,6 @@ func StartStream(deviceSN, stationSN string, channel, codec int) *StreamSession 
 		LastUpdate:      time.Now().UnixMilli(),
 		lastKeyFrameIdx: -1,
 		awaitKeyframe:   true,
-		noKeyFrameSince: time.Now().UnixMilli(),
 	}
 
 	activeStreams[key] = session
@@ -132,9 +127,8 @@ func StopStreamIfID(deviceSN string, channel int, id int64) bool {
 	return true
 }
 
-// GetStream returns the session for a specific device channel. Multi-lens
-// devices run one session per lens, so callers addressing a specific view
-// must pass the channel; use -1 to look up whichever session exists first.
+// GetStream returns the session for a device channel. Use -1 to look up
+// whichever session exists for the device.
 func GetStream(deviceSN string, channel int) *StreamSession {
 	streamsMutex.RLock()
 	defer streamsMutex.RUnlock()
@@ -155,7 +149,7 @@ func GetStream(deviceSN string, channel int) *StreamSession {
 }
 
 // StreamChannelsForDevice returns the channels that currently have live
-// sessions for a device (one per lens on multi-lens devices).
+// sessions for a device.
 func StreamChannelsForDevice(deviceSN string) []int {
 	streamsMutex.RLock()
 	defer streamsMutex.RUnlock()
@@ -170,3 +164,4 @@ func StreamChannelsForDevice(deviceSN string) []int {
 	sort.Ints(channels)
 	return channels
 }
+

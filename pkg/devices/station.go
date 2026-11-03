@@ -20,11 +20,12 @@ type Station struct {
 	apiClient     *api.Client
 	dskKey        string
 	streamClients map[string]*p2p.Client
-	// streamKeys remembers the RSA public-modulus payload used for each
-	// device's stream client so multi-lens starts reuse the same key.
+	// streamKeys remembers the RSA key used for each device's stream client
+	// so repeated starts on the same device reuse the same key.
 	streamRSA map[string]*rsa.PrivateKey
-	// streamChannels tracks the lenses currently streaming per device so the
-	// shared P2P client is only closed when the LAST lens stops.
+	// streamChannels tracks which channels are currently streaming per
+	// device so the shared P2P client is only closed when the device's last
+	// stream stops.
 	streamChannels map[string]map[byte]bool
 	connTimeout    time.Duration
 	encTimeout     time.Duration
@@ -38,19 +39,7 @@ var (
 	stationsMutex  sync.RWMutex
 )
 
-func NewStation(apiStation *api.Station) (*Station, error) {
-	return &Station{
-		apiStation:     apiStation,
-		p2pClient:      nil,
-		streamClients:  make(map[string]*p2p.Client),
-		streamRSA:      make(map[string]*rsa.PrivateKey),
-		streamChannels: make(map[string]map[byte]bool),
-	}, nil
-}
 
-func (s *Station) Connect(dskKey string) error {
-	return s.ConnectWithAPI(dskKey, nil)
-}
 
 func (s *Station) ConnectWithAPI(dskKey string, apiClient *api.Client) error {
 	s.mu.Lock()
@@ -189,14 +178,15 @@ func (s *Station) IsConnected() bool {
 }
 
 // StartLivestream opens (or reuses) the dedicated P2P connection for a
-// device and starts the realtime stream on the given channel.
-//
-// Multi-lens devices (Battery Doorbell Plus E340, SoloCam S340/E42 pan-tilt)
-// expose one lens per channel - e.g. the E340's main lens on device_channel
-// and its package lens on device_channel+1. Channels of the same device share
-// ONE P2P connection: a start for an already-connected device only registers
-// a video callback for the new channel and sends the start command again.
-func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, callback p2p.StreamCallback) error {
+// device and starts the realtime stream on the given channel. HomeBase
+// channel slots are DEVICE slots: a channel belongs to one device, and
+// multi-lens cameras (Battery Doorbell Plus E340, SoloCam S340/E42) deliver
+// all lenses composited in ONE stream on the device's own channel — never
+// request channel+1 for a second lens; that grabs the next device's feed.
+// Repeated starts for an already-connected device reuse the shared P2P
+// connection and only re-register the callback and re-send the start command.
+// deviceType selects the per-family START command variant.
+func (s *Station) StartLivestream(deviceSN string, channel int, deviceType int, videoCodec int, callback p2p.StreamCallback) error {
 	s.mu.Lock()
 	dskKey := s.dskKey
 	apiClient := s.apiClient
@@ -205,8 +195,8 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 	discAttempts := s.discAttempts
 	ackTimeout := s.ackTimeout
 
-	// Multi-lens reuse: if a stream client is already live for this device,
-	// share it instead of tearing it down (which would kill the other lens).
+	// Reuse: if a stream client is already live for this device, share it
+	// instead of tearing it down.
 	existing := s.streamClients[deviceSN]
 	if existing != nil && !existing.IsConnected() {
 		debuglog.Debugf("StartLivestream: existing stream connection for %s is dead, replacing", deviceSN)
@@ -226,19 +216,18 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 	ch := byte(channel)
 
 	if existing != nil {
-		// Shared-connection path: register the callback for this lens and
-		// send the start command. The RSA key from the original connect is
-		// kept so per-frame AES decryption stays consistent.
+		// Shared-connection path: register the callback for this channel and
+		// re-send the start command. The RSA key from the original connect
+		// is kept so per-frame AES decryption stays consistent.
 		debuglog.Debugf("StartLivestream: reusing P2P connection for %s channel %d", deviceSN, channel)
 		existing.SetVideoCallback(deviceSN, ch, callback)
 
 		rsaKey := s.streamRSA[deviceSN]
-		payloadData := livestreamPayload(s.apiStation.Member.AdminUserID, channel, rsaKey)
-		payloadJSON, err := json.Marshal(payloadData)
+		cmdType, payloadJSON, err := livestreamCommand(deviceType, channel, s.apiStation.Member.AdminUserID, rsaKey, videoCodec)
 		if err != nil {
 			return fmt.Errorf("failed to marshal payload: %w", err)
 		}
-		if err := existing.SendCommandWithStringPayload(p2p.CMD_SET_PAYLOAD, ch, string(payloadJSON)); err != nil {
+		if err := existing.SendCommandWithStringPayload(cmdType, ch, payloadJSON); err != nil {
 			return fmt.Errorf("failed to send start command: %w", err)
 		}
 		s.mu.Lock()
@@ -291,21 +280,29 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 	s.streamChannels[deviceSN][ch] = true
 	s.mu.Unlock()
 
-	payloadData := livestreamPayload(s.apiStation.Member.AdminUserID, channel, rsaKey)
-	payloadJSON, err := json.Marshal(payloadData)
+	cmdType, payloadJSON, err := livestreamCommand(deviceType, channel, s.apiStation.Member.AdminUserID, rsaKey, videoCodec)
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	debuglog.Debugf("StartLivestream: account_id=%s channel=%d device=%s", s.apiStation.Member.AdminUserID, channel, deviceSN)
+	debuglog.Debugf("StartLivestream: account_id=%s channel=%d device=%s cmd=%d",
+		s.apiStation.Member.AdminUserID, channel, deviceSN, cmdType)
 
-	return streamClient.SendCommandWithStringPayload(p2p.CMD_SET_PAYLOAD, ch, string(payloadJSON))
+	return streamClient.SendCommandWithStringPayload(cmdType, ch, payloadJSON)
 }
 
-// livestreamPayload builds the CMD_SET_PAYLOAD (1350) JSON for starting a
-// realtime stream. Verified live against eufyCam 3C (H264), SoloCam S340 and
-// SoloCam E42 pan-tilt (H265) and Battery Doorbell Plus E340 (dual-lens).
-func livestreamPayload(accountID string, channel int, rsaKey *rsa.PrivateKey) map[string]interface{} {
+// livestreamCommand builds the START livestream command for a device family.
+//
+// Pan-tilt cameras (SoloCam S340/E42 etc.) and dual-lens battery doorbells
+// (E340/C30) use CMD_DOORBELL_SET_PAYLOAD (1700) wrapping
+// ParamType.COMMAND_START_LIVESTREAM (1000), and take streamtype in the
+// VideoCodec numbering (0=H264, 1=H265). Requesting H264 (0) here makes
+// these cameras emit H264 directly, which browsers can play without
+// transcoding.
+//
+// HomeBase-managed eufyCam-family cameras keep the classic CMD_SET_PAYLOAD
+// (1350) wrapper (verified live: eufyCam 3C "Front Camera").
+func livestreamCommand(deviceType int, channel int, accountID string, rsaKey *rsa.PrivateKey, videoCodec int) (p2p.CommandType, string, error) {
 	rsaPubKeyHex := ""
 	if rsaKey != nil {
 		n := rsaKey.N.Bytes()
@@ -313,7 +310,53 @@ func livestreamPayload(accountID string, channel int, rsaKey *rsa.PrivateKey) ma
 			rsaPubKeyHex = fmt.Sprintf("%x", n[1:])
 		}
 	}
-	return map[string]interface{}{
+
+	if IsOutdoorPanTiltCamera(deviceType) || IsBatteryDoorbellDual(deviceType) {
+		data := map[string]interface{}{
+			"accountId":   accountID,
+			"camera_type": 0,
+			"encryptkey":  rsaPubKeyHex,
+			"entrytype":   0,
+			"streamtype":  videoCodec,
+		}
+		v, err := json.Marshal(map[string]interface{}{
+			"commandType": 1000, // ParamType.COMMAND_START_LIVESTREAM
+			"data":        data,
+		})
+		if err != nil {
+			return 0, "", err
+		}
+		return p2p.CMD_DOORBELL_SET_PAYLOAD, string(v), nil
+	}
+
+	if IsIndoorPanTiltCamera(deviceType) {
+		data := map[string]interface{}{
+			"accountId":   accountID,
+			"camera_type": 0,
+			"encryptkey":  rsaPubKeyHex,
+			"entrytype":   0,
+			"msg_id":      86,
+			"streamtype":  videoCodec,
+		}
+		v, err := json.Marshal(map[string]interface{}{
+			"commandType": 1000,
+			"data":        data,
+		})
+		if err != nil {
+			return 0, "", err
+		}
+		return p2p.CMD_DOORBELL_SET_PAYLOAD, string(v), nil
+	}
+
+	// Default: HomeBase-managed eufyCam family (streamtype numbering here is
+	// 1=H264, 2=H265 - different from the VideoCodec enum).
+	v := videoCodec
+	if v == 0 {
+		v = 1
+	} else if v == 1 {
+		v = 2
+	}
+	payload := map[string]interface{}{
 		"account_id": accountID,
 		"cmd":        int(p2p.CMD_START_REALTIME_MEDIA),
 		"mChannel":   channel,
@@ -323,13 +366,18 @@ func livestreamPayload(accountID string, channel int, rsaKey *rsa.PrivateKey) ma
 			"camera_type": 0,
 			"entrytype":   0,
 			"key":         rsaPubKeyHex,
-			"streamtype":  1,
+			"streamtype":  v,
 		},
 	}
+	wrapped, err := json.Marshal(payload)
+	if err != nil {
+		return 0, "", err
+	}
+	return p2p.CMD_SET_PAYLOAD, string(wrapped), nil
 }
 
-// StopLivestream stops one lens of a device. The shared P2P connection is
-// only closed when the device's LAST streaming lens stops.
+// StopLivestream stops one channel of a device. The shared P2P connection
+// is only closed when the device's LAST active stream stops.
 func (s *Station) StopLivestream(deviceSN string, channel int) error {
 	s.mu.Lock()
 	sc, ok := s.streamClients[deviceSN]
