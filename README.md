@@ -45,7 +45,7 @@ All config values overridable via env vars:
 | `AUTH_PASSWORD` | `[auth]` password | |
 | `STREAM_ENABLED` | `[stream]` enabled | `false` |
 | `STREAM_PORT` | `[stream]` port | |
-| `STREAM_BIND` | `[stream]` bind | `0.0.0.0` |
+| `STREAM_BIND` | `[stream]` bind | `127.0.0.1` |
 
 Env vars override `config.toml` values when set.
 
@@ -63,39 +63,38 @@ Opens browser to `http://localhost:8080/login`. Web UI handles login + captcha (
 You can protect the server with digest auth if you want (see `[auth]` section of the toml).  If you want TLS, you should front the server via nginx or similar.
 
 
-You can view your cameras and stream directly from the server ux.  That said, for forwarding your cameras to frigate or similar, you'll need the CLI piece or to enable the stream feature.
-Eufy will frequently prompt for CAPTCHA's on login.  Therefore once the server is running and maintaining a session, you can use the CLI tool to stream camera feeds from your server.
-The server handles the P2P streaming and maintaining the session.  The cli tool borrows the session from the server and can steam mpeg-ts directly to stdout so that you can pipe it wherever you want
-You can of course pipe this to ffmpeg and do anything you want with it.
+You can view your cameras and stream directly from the server's web UI at `http://localhost:8080` — every camera plays at a bare path like `/stream/<deviceSN>`, no parameters.
 
-### Public Stream Port
+For consuming streams with ffmpeg, ffplay, frigate, or similar, every
+camera is available as a static MPEG-TS URL on the main server — see
+[Streaming with ffmpeg](#streaming-with-ffmpeg). The optional
+[Public Stream Port](#public-stream-port) adds a separate unauthenticated
+port for NVR deployments where the main server runs digest auth. The CLI
+tool is a convenience for listing cameras and piping streams, and handles
+the digest-auth case for scripted consumers (see its section below).
 
-Enable a second HTTP port that serves raw MPEG-TS streams with no authentication. Streams auto-start on connect and teardown after all clients disconnect (30s grace).  If you enable this feature, these streams will be unauthenticated.  You can still use the eufy-cli client without this feature enabled to have an authenticated stream.
+## Streaming with ffmpeg
 
-```toml
-[stream]
-enabled = true
-port = 8090
-bind = "0.0.0.0"
-```
-
-Then connect directly — the URL is just the camera's device SN, no parameters:
+Every camera is a static MPEG-TS URL on the main server — the URL is just
+the camera's device SN, no parameters:
 
 ```bash
 # Play a camera
-ffplay http://localhost:8090/T8134P2024342790
+ffplay http://localhost:8080/api/stream/T8134P2024342790
 
 # Record 60 seconds without re-encoding
-ffmpeg -i http://localhost:8090/T8134P2024342790 -c copy -t 60 out.mp4
+ffmpeg -i http://localhost:8080/api/stream/T8134P2024342790 -c copy -t 60 out.mp4
 
 # Use in frigate / other NVRs
-ffmpeg -i http://localhost:8090/<deviceSN> ...
+ffmpeg -i http://localhost:8080/api/stream/<deviceSN> ...
 ```
 
-Both H.264 and H.265 cameras work — the stream is standard MPEG-TS and
-ffmpeg/ffplay/VLC decode HEVC natively (the browser HEVC limitation does not
-apply here). Multiple clients can connect to the same camera URL; when the
-last one disconnects, the P2P stream is torn down after 30 seconds.
+The stream auto-starts on connect (waking battery cameras as needed) and
+stops ~30 seconds after the last consumer of that camera disconnects —
+across every endpoint (web UI, ffmpeg, CLI, stream port). Both H.264 and
+H.265 cameras work: the output is standard MPEG-TS and ffmpeg/ffplay/VLC
+decode HEVC natively (the browser HEVC limitation does not apply here).
+Multiple simultaneous consumers of the same camera share one P2P session.
 
 **First connect can be slow — two things to know:**
 
@@ -111,27 +110,70 @@ last one disconnects, the P2P stream is torn down after 30 seconds.
    delay: rapid start/stop cycles can put these cameras in a temporary
    refuse state for about a minute.
 
+### Public Stream Port
 
-**CLI:**
+An OPTIONAL second port serving the same MPEG-TS streams with **no
+authentication**. This exists for NVR-style deployments: run digest auth on
+the main port for the web UI, and expose only the stream port to your
+recorder. It binds to loopback by default — set `bind` to `0.0.0.0` or a
+specific interface IP to expose it.
 
-```bash
-# List cameras
-./eufy-cli list
-
-# Stream camera to stdout (MPEG-TS)
-./eufy-cli stream <deviceSN> [channel]
-
-# Pipe to ffmpeg
-./eufy-cli stream T8134... | ffplay -i - 
-# If digest auth is enabled on the server
-./eufy-cli -user admin -pass secret -server http://localhost:8080 list
+```toml
+[stream]
+enabled = true
+port = 8090
+# bind = "127.0.0.1"   # default; change to expose, e.g. "0.0.0.0" or "192.168.1.10"
 ```
 
-## Streaming
+```bash
+ffplay http://localhost:8090/T8134P2024342790
+```
+
+Consumers are counted together with the main port: the camera keeps
+streaming until the last consumer anywhere is gone for 30 seconds. Remember
+these URLs are unauthenticated — only expose the port where you intend to.
+
+
+## CLI (convenience tool)
+
+The `eufy-cli` tool lists cameras and pipes a camera's MPEG-TS stream to
+stdout so you can feed it straight into ffmpeg. It talks to the running
+server (which owns the Eufy session and P2P connections), resolves the
+camera's channel automatically, keeps the stream alive with a heartbeat
+while running, and stops the camera cleanly on exit.
+
+```bash
+# List cameras (SN, name, model, channel)
+./eufy-cli list
+
+# Stream a camera to stdout as MPEG-TS
+./eufy-cli stream T8134P2024342790 | ffplay -i -
+
+# Record 60 seconds
+./eufy-cli stream T8134P2024342790 | ffmpeg -i - -c copy -t 60 out.mp4
+```
+
+**When you don't need it:** if digest auth is disabled (the default) and the
+public stream port is enabled, point ffmpeg/ffplay directly at the stream
+port URL — see [Public Stream Port](#public-stream-port).
+
+**When you do need it:** if you enable digest auth (the `[auth]` section of
+the toml), everything under the main port requires credentials. Browsers
+handle the digest prompt natively for the web UI, but scripted consumers
+like ffmpeg get clumsy there. The CLI handles the credentials for you —
+including the authenticated keep-alive heartbeat — on both `list` and
+`stream`:
+
+```bash
+./eufy-cli --user admin --pass secret list
+./eufy-cli --user admin --pass secret stream T8134P2024342790 | ffplay -
+```
+
+## Streaming behavior
 
 **Multiple cameras simultaneously:** Each camera stream establishes its own dedicated P2P connection to the hub, so multiple cameras can stream concurrently without interfering with each other.
 
-**Multiple clients, same camera:** Multiple clients can connect to and view the same camera stream concurrently. The server maintains a shared frame buffer — all connected clients receive the same frames without creating additional P2P connections. The stream stays alive as long as at least one client is connected (with a 30-second grace period after the last disconnect).
+**Multiple clients, same camera:** Multiple clients can connect to and view the same camera stream concurrently — across the web UI, ffmpeg, the CLI, and the stream port. The server maintains a shared frame buffer — all connected clients receive the same frames without creating additional P2P connections. The stream stays alive as long as at least one consumer anywhere is connected (with a 30-second grace period after the last disconnect).
 
 ## Architecture
 

@@ -181,21 +181,10 @@
 
 					this.setMsg('<span class="spinner"></span>Establishing P2P connection...');
 
-					let startResp;
-					try {
-						startResp = await authFetch(`/api/stream/start/${this.deviceSN}`, { method: 'POST' });
-					} catch (e) {
-						console.error('Stream start request failed:', e);
-						this.initiateRecovery('start request failed: ' + e.message);
-						return;
-					}
-					if (!startResp || !startResp.ok) {
-						const errText = startResp ? await startResp.text() : 'Authentication required';
-						this.setMsg('Failed to start stream: ' + errText);
-						return;
-					}
-
-					this.setMsg('<span class="spinner"></span>Loading video stream...');
+					// No explicit start: the stream request itself auto-starts the
+					// camera server-side and registers this connection as a
+					// consumer for the stream's lifetime.
+					this.setMsg('<span class="spinner"></span>Connecting to camera...');
 
 					this.player = mpegts.createPlayer({
 						type: 'mpegts',

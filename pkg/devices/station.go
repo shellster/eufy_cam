@@ -296,9 +296,10 @@ func (s *Station) StartLivestream(deviceSN string, channel int, deviceType int, 
 // Pan-tilt cameras (SoloCam S340/E42 etc.) and dual-lens battery doorbells
 // (E340/C30) use CMD_DOORBELL_SET_PAYLOAD (1700) wrapping
 // ParamType.COMMAND_START_LIVESTREAM (1000), and take streamtype in the
-// VideoCodec numbering (0=H264, 1=H265). Requesting H264 (0) here makes
-// these cameras emit H264 directly, which browsers can play without
-// transcoding.
+// VideoCodec numbering (0=H264, 1=H265). H264 is requested, but the
+// pan-tilt family streams H.265 regardless of the requested streamtype —
+// the session detects the real codec from the frame headers and the web
+// player picks the WASM decode path.
 //
 // HomeBase-managed eufyCam-family cameras keep the classic CMD_SET_PAYLOAD
 // (1350) wrapper (verified live: eufyCam 3C "Front Camera").

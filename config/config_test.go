@@ -157,3 +157,36 @@ ack_timeout = 8
 		t.Errorf("ackDur = %v, want 8s", ackDur)
 	}
 }
+
+func TestStreamBindDefaultsToLoopback(t *testing.T) {
+	// The stream port is unauthenticated: without an explicit bind it must
+	// stay on loopback instead of every interface.
+	path := writeTestConfig(t, `[stream]
+enabled = true
+port = 8090
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Stream.Bind != "127.0.0.1" {
+		t.Fatalf("default stream bind = %q, want 127.0.0.1", cfg.Stream.Bind)
+	}
+}
+
+func TestStreamBindExplicit(t *testing.T) {
+	path := writeTestConfig(t, `[stream]
+enabled = true
+port = 8090
+bind = "0.0.0.0"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Stream.Bind != "0.0.0.0" {
+		t.Fatalf("explicit stream bind = %q, want 0.0.0.0", cfg.Stream.Bind)
+	}
+}

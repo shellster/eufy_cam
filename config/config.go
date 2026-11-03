@@ -170,7 +170,10 @@ func Load(path string) (*Config, error) {
 		cfg.P2P.AckTimeout = 15
 	}
 	if cfg.Stream.Bind == "" {
-		cfg.Stream.Bind = "0.0.0.0"
+		// The stream port is UNAUTHENTICATED: default to loopback so it is
+		// not silently exposed on every interface. Bind explicitly (e.g.
+		// "0.0.0.0" or a specific interface IP) to expose it to an NVR.
+		cfg.Stream.Bind = "127.0.0.1"
 	}
 
 	return &cfg, nil

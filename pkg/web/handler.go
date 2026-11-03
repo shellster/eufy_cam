@@ -73,16 +73,76 @@ func (w *watcherSet) remove(deviceSN string, channel int, expire func()) {
 	key := fmt.Sprintf("%s#%d", deviceSN, channel)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.counts[key]--
-	remaining := w.counts[key]
-	if remaining <= 0 {
-		delete(w.counts, key)
-		w.timers[key] = time.AfterFunc(w.grace, func() {
-			w.mu.Lock()
-			delete(w.timers, key)
-			w.mu.Unlock()
+	count, ok := w.counts[key]
+	if !ok {
+		// Spurious remove (double disconnect, error path after a failed
+		// start): nothing is tracked. No-op — decrementing an absent key
+		// would re-arm a second grace timer while the first still fires.
+		return
+	}
+	count--
+	if count > 0 {
+		w.counts[key] = count
+		return
+	}
+	delete(w.counts, key)
+	w.timers[key] = time.AfterFunc(w.grace, func() {
+		w.mu.Lock()
+		delete(w.timers, key)
+		// Re-check under the lock: add() cancels PENDING timers, but a
+		// timer whose callback already started cannot be cancelled — a
+		// consumer that arrived milliseconds ago must not have its stream
+		// killed by an expire that raced its own add().
+		empty := w.counts[key] == 0
+		w.mu.Unlock()
+		if empty {
 			expire()
-		})
+		}
+	})
+}
+
+
+// resolveChannel determines the device channel a request targets: an
+// explicit ?channel= override, else the device's own channel from the cloud
+// device list. Deterministic on every endpoint so all watchers for one
+// camera land on the same streamWatchers key.
+func resolveChannel(r *http.Request, s *Server, deviceSN string) (int, bool) {
+	channel := -1
+	if ch, err := strconv.Atoi(r.URL.Query().Get("channel")); err == nil {
+		channel = ch
+	}
+	if channel < 0 {
+		device, err := s.findDevice(deviceSN)
+		if err != nil {
+			return -1, false
+		}
+		channel = device.Channel
+	}
+	return channel, true
+}
+
+// stopExpiredStream stops a stream whose last consumer left one grace
+// period ago. It serializes on the per-device lifecycle lock against
+// concurrent starts/restarts, and resolves BOTH the session and its station
+// from one locked snapshot so a session installed moments later cannot be
+// stopped through a stale station pointer. idPtr is live: the HTTP serve
+// loops update it on session replacement and the WS handler refreshes it on
+// ping, so the ID guard tracks the current session instead of a stale one.
+func (s *Server) stopExpiredStream(deviceSN string, channel int, idPtr *int64) {
+	lock := streamOpLock(deviceSN)
+	lock.Lock()
+	defer lock.Unlock()
+
+	strm := stream.GetStream(deviceSN, channel)
+	if strm == nil || strm.ID != *idPtr {
+		return
+	}
+	station := devices.GetStation(strm.Station)
+	if stream.StopStreamIfID(deviceSN, channel, strm.ID) {
+		log.Printf("Stream: grace period expired for %s ch=%d, stopping livestream (streamID=%d)", deviceSN, channel, strm.ID)
+		if station != nil {
+			_ = station.StopLivestream(deviceSN, channel)
+		}
 	}
 }
 
@@ -98,10 +158,13 @@ func streamOpLock(deviceSN string) *sync.Mutex {
 
 const streamGracePeriod = 30 * time.Second
 
-var (
-	wsWatchers   = newWatcherSet(streamGracePeriod)
-	portWatchers = newWatcherSet(streamGracePeriod)
-)
+// streamWatchers tracks EVERY consumer of a device channel across all
+// endpoints (TS HTTP, raw HTTP, WebSocket heartbeat, stream port): the
+// stream is stopped only when the last consumer anywhere is gone for the
+// grace period. Splitting this count per endpoint caused a browser tab
+// close (heartbeat count → 0) to kill a stream an NVR client was still
+// pulling on another port.
+var streamWatchers = newWatcherSet(streamGracePeriod)
 
 type Server struct {
 	apiClient *api.Client
@@ -204,17 +267,22 @@ func (s *Server) StreamPortHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Optional channel selection. Default -1 resolves to the device's
-	// primary channel.
-	channelStr := r.URL.Query().Get("channel")
-	channel := -1
-	if channelStr != "" {
-		if ch, err := strconv.Atoi(channelStr); err == nil {
-			channel = ch
-		}
+	channel, ok := resolveChannel(r, s, deviceSN)
+	if !ok {
+		http.Error(w, "device not found: "+deviceSN, http.StatusNotFound)
+		return
 	}
 
-	// Auto-start stream if not already running
+	// streamID is shared with the serve loop: on a mid-connection session
+	// replacement the loop updates it so this expire never guards against a
+	// stale ID (a stale guard silently leaks the stream forever).
+	streamID := int64(0)
+	count := streamWatchers.add(deviceSN, channel)
+	log.Printf("Stream port: client connected to %s ch=%d (active: %d)", deviceSN, channel, count)
+	defer streamWatchers.remove(deviceSN, channel, func() {
+		s.stopExpiredStream(deviceSN, channel, &streamID)
+	})
+
 	strm := stream.GetStream(deviceSN, channel)
 	if strm == nil || strm.IsStale() {
 		if err := s.startStreamForDevice(deviceSN, channel); err != nil {
@@ -227,52 +295,67 @@ func (s *Server) StreamPortHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to start stream", http.StatusInternalServerError)
 		return
 	}
-	channel = strm.Channel
+	streamID = strm.ID
 
-	// Track client
-	streamID := strm.ID
-	stationSN := strm.Station
-
-	count := portWatchers.add(deviceSN, channel)
-	log.Printf("Stream port: client connected to %s ch=%d (active: %d)", deviceSN, channel, count)
-
-	defer portWatchers.remove(deviceSN, channel, func() {
-		// Only stop if the stream hasn't been replaced by a new one
-		if stream.StopStreamIfID(deviceSN, channel, streamID) {
-			log.Printf("Stream port: grace period expired for %s, stopping livestream (streamID=%d)", deviceSN, streamID)
-			if station := devices.GetStation(stationSN); station != nil {
-				_ = station.StopLivestream(deviceSN, channel)
-			}
-		}
-	})
-
-	s.serveStreamFrames(w, r, deviceSN, strm, "Stream port")
+	s.serveStreamFrames(w, r, deviceSN, strm, &streamID, "Stream port")
 }
 
-// serveStreamFrames polls the session for new frames and writes them to the
+// ptsRemapper maps session PTS onto a connection-relative timeline that
+// starts near zero — MSE only decodes when currentTime is inside the
+// buffered range, and session PTS grows for minutes. It must survive a
+// mid-connection session REPLACEMENT: a replacement session's PTS restarts
+// near 1000 while this connection's base may be minutes in, so the naive
+// difference underflows uint64 and the muxer emits garbage timestamps. On
+// Reset (called by the serve loop when it re-binds) the base re-arms, and
+// every output is clamped monotonically so consumers never see timestamps
+// regress across the replacement boundary.
+type ptsRemapper struct {
+	base     uint64
+	haveBase bool
+	last     uint64
+	haveLast bool
+}
+
+func (p *ptsRemapper) Remap(pts uint64) uint64 {
+	if !p.haveBase {
+		p.haveBase = true
+		p.base = pts
+	}
+	if pts < p.base {
+		pts = p.base // defensive: never let the difference underflow
+	}
+	out := pts - p.base + 1000
+	if p.haveLast && out <= p.last {
+		out = p.last + 1
+	}
+	p.last = out
+	p.haveLast = true
+	return out
+}
+
+// Reset re-arms the base for a replacement session. The monotonic clamp
+// state is deliberately kept.
+func (p *ptsRemapper) Reset() {
+	p.haveBase = false
+}
+
+// serveStreamFrames polls the session for new frames and writes to the
 // response as MPEG-TS until the client disconnects or the stream goes away.
 // If the session object is replaced mid-connection (player-driven restart),
-// the loop re-binds to the new session instead of serving a dead one.
-func (s *Server) serveStreamFrames(w http.ResponseWriter, r *http.Request, deviceSN string, strm *stream.StreamSession, label string) {
+// the loop re-binds to the new session instead of serving a dead one:
+// streamIDPtr is updated so the caller's grace-expire guard tracks the live
+// session, and the PTS remapper re-arms for the replacement's restarted
+// clock.
+func (s *Server) serveStreamFrames(w http.ResponseWriter, r *http.Request, deviceSN string, strm *stream.StreamSession, streamIDPtr *int64, label string) {
 	streamID := strm.ID
+	*streamIDPtr = streamID
 
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
-	// ptsBase: first PTS this connection served. Frames are remapped to
-	// (pts - ptsBase + 1000ms) so a viewer joining a long-running session
-	// gets timestamps starting near zero — MSE only decodes when currentTime
-	// is inside the buffered range, and session PTS grows for minutes.
-	var ptsBase uint64
-	havePTSBase := false
-	remapPTS := func(pts uint64) uint64 {
-		if !havePTSBase {
-			havePTSBase = true
-			ptsBase = pts
-		}
-		return pts - ptsBase + 1000
-	}
+	remapper := &ptsRemapper{}
+	remapPTS := remapper.Remap
 
 	var muxer *mpegts.Muxer
 	defer func() {
@@ -305,7 +388,12 @@ func (s *Server) serveStreamFrames(w http.ResponseWriter, r *http.Request, devic
 					label, deviceSN, streamID, cur.ID)
 				strm = cur
 				streamID = cur.ID
+				*streamIDPtr = streamID
 				lastFrameID = 0
+				// The replacement session's PTS clock restarts; re-arm the
+				// base so the remapped timeline stays sane (the clamp keeps
+				// it monotonic for the consumer).
+				remapper.Reset()
 			}
 			if time.Since(lastRestartCheck) > 2*time.Second && strm.NeedsRestart() {
 				lastRestartCheck = time.Now()
@@ -350,18 +438,20 @@ func (s *Server) RawStreamHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	deviceSN := vars["deviceSN"]
 
-	channelStr := r.URL.Query().Get("channel")
-	channel := -1
-	if channelStr != "" {
-		if ch, err := strconv.Atoi(channelStr); err == nil {
-			channel = ch
-		}
+	channel, ok := resolveChannel(r, s, deviceSN)
+	if !ok {
+		http.Error(w, "device not found: "+deviceSN, http.StatusNotFound)
+		return
 	}
-	if channel < 0 {
-		if device, err := s.findDevice(deviceSN); err == nil {
-			channel = device.Channel
-		}
-	}
+
+	// Join the consumer set BEFORE starting (cancels any pending grace
+	// timer from a previous consumer first). streamID is shared with the
+	// serve loop; it stays 0 if the start fails, making the expire a no-op.
+	streamID := int64(0)
+	streamWatchers.add(deviceSN, channel)
+	defer streamWatchers.remove(deviceSN, channel, func() {
+		s.stopExpiredStream(deviceSN, channel, &streamID)
+	})
 
 	if err := s.startStreamForDevice(deviceSN, channel); err != nil {
 		switch {
@@ -380,15 +470,22 @@ func (s *Server) RawStreamHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("stream not found for device %s", deviceSN), http.StatusNotFound)
 		return
 	}
+	streamID = strm.ID
 
-	s.serveRawFrames(w, r, deviceSN, strm)
+	s.serveRawFrames(w, r, deviceSN, strm, &streamID)
 }
 
 // serveRawFrames polls the session and writes framed Annex-B access units:
 // [u32 LE length][payload]. Payload is the same AU data the MPEG-TS path
 // would mux (Annex-B NALs, keyframe-aligned start).
-func (s *Server) serveRawFrames(w http.ResponseWriter, r *http.Request, deviceSN string, strm *stream.StreamSession) {
+// serveRawFrames polls the session and writes framed Annex-B access units:
+// [u32 LE length][payload]. Payload is the same AU data the MPEG-TS path
+// would mux (Annex-B NALs, keyframe-aligned start). streamIDPtr is updated
+// on mid-connection session replacement so the caller's grace-expire guard
+// tracks the live session.
+func (s *Server) serveRawFrames(w http.ResponseWriter, r *http.Request, deviceSN string, strm *stream.StreamSession, streamIDPtr *int64) {
 	streamID := strm.ID
+	*streamIDPtr = streamID
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -426,6 +523,7 @@ func (s *Server) serveRawFrames(w http.ResponseWriter, r *http.Request, deviceSN
 			if cur.ID != streamID {
 				strm = cur
 				streamID = cur.ID
+				*streamIDPtr = streamID
 				lastFrameID = 0
 			}
 			if time.Since(lastRestartCheck) > 2*time.Second && strm.NeedsRestart() {
@@ -785,21 +883,44 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	channelStr := r.URL.Query().Get("channel")
-	channel := -1
-	if channelStr != "" {
-		if ch, err := strconv.Atoi(channelStr); err == nil {
-			channel = ch
-		}
-	}
-
-	strm := stream.GetStream(deviceSN, channel)
-	if strm == nil {
-		http.Error(w, fmt.Sprintf("stream not found for device %s", deviceSN), http.StatusNotFound)
+	channel, ok := resolveChannel(r, s, deviceSN)
+	if !ok {
+		http.Error(w, "device not found: "+deviceSN, http.StatusNotFound)
 		return
 	}
 
-	s.serveStreamFrames(w, r, deviceSN, strm, "StreamHandler")
+	// Join the consumer set BEFORE starting: a pending grace timer from a
+	// previous consumer must be cancelled before the (possibly slow, up to
+	// ~60s camera wake) start runs. streamID is shared with the serve loop
+	// so the expire guard tracks the live session across replacements; it
+	// stays 0 if the start fails, making the expire a no-op.
+	streamID := int64(0)
+	streamWatchers.add(deviceSN, channel)
+	defer streamWatchers.remove(deviceSN, channel, func() {
+		s.stopExpiredStream(deviceSN, channel, &streamID)
+	})
+
+	if strm := stream.GetStream(deviceSN, channel); strm == nil || strm.IsStale() {
+		if err := s.startStreamForDevice(deviceSN, channel); err != nil {
+			switch {
+			case errors.Is(err, errDeviceNotFound):
+				http.Error(w, err.Error(), http.StatusNotFound)
+			case errors.Is(err, errStationOffline), errors.Is(err, errStationNotFound):
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			default:
+				http.Error(w, "failed to start livestream", http.StatusInternalServerError)
+			}
+			return
+		}
+	}
+	strm := stream.GetStream(deviceSN, channel)
+	if strm == nil {
+		http.Error(w, "failed to start stream", http.StatusInternalServerError)
+		return
+	}
+	streamID = strm.ID
+
+	s.serveStreamFrames(w, r, deviceSN, strm, &streamID, "StreamHandler")
 }
 
 func (s *Server) StreamWebSocketHandler(w http.ResponseWriter, r *http.Request) {
@@ -813,43 +934,43 @@ func (s *Server) StreamWebSocketHandler(w http.ResponseWriter, r *http.Request) 
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Capture the stream session details at connect time so we only stop THIS stream on disconnect
-	channelStr := r.URL.Query().Get("channel")
+	// Deterministic watcher key: the live session's channel if one exists,
+	// else the device's own channel from the cloud device list (the channel
+	// a subsequent auto-start will use). streamID stays 0 when no session
+	// exists, making the expire a no-op.
 	watchChannel := -1
-	if channelStr != "" {
-		if ch, err := strconv.Atoi(channelStr); err == nil {
-			watchChannel = ch
-		}
+	if ch, err := strconv.Atoi(r.URL.Query().Get("channel")); err == nil {
+		watchChannel = ch
 	}
-	strm := stream.GetStream(deviceSN, watchChannel)
-	var streamID int64
-	var stationSN string
-	var channel int
-	if strm != nil {
-		streamID = strm.ID
-		stationSN = strm.Station
+	channel := watchChannel
+	streamID := int64(0)
+	if strm := stream.GetStream(deviceSN, watchChannel); strm != nil {
 		channel = strm.Channel
+		streamID = strm.ID
+	} else if dev, err := s.findDevice(deviceSN); err == nil {
+		channel = dev.Channel
+	} else {
+		channel = -1
 	}
 
-	count := wsWatchers.add(deviceSN, channel)
+	count := streamWatchers.add(deviceSN, channel)
 	debuglog.Debugf("StreamWebSocket: watcher connected for %s ch=%d (total watchers: %d, streamID=%d)", deviceSN, channel, count, streamID)
-
-	defer wsWatchers.remove(deviceSN, channel, func() {
-		// Only stop if the stream hasn't been replaced by a new one
-		if stream.StopStreamIfID(deviceSN, channel, streamID) {
-			debuglog.Debugf("StreamWebSocket: grace period expired for %s, stopping livestream (streamID=%d)", deviceSN, streamID)
-			if station := devices.GetStation(stationSN); station != nil {
-				_ = station.StopLivestream(deviceSN, channel)
-			}
-		}
+	defer streamWatchers.remove(deviceSN, channel, func() {
+		s.stopExpiredStream(deviceSN, channel, &streamID)
 	})
 
-	_ = conn.SetReadDeadline(time.Now().Add(8 * time.Second))
+	// Pings refresh the read deadline AND the bound session: if the stream
+	// is replaced while this heartbeat lives, the expire guard must track
+	// the live session ID (residual staleness <= one ping interval, 3s).
 	conn.SetPingHandler(func(appData string) error {
+		if cur := stream.GetStream(deviceSN, channel); cur != nil {
+			streamID = cur.ID
+		}
 		_ = conn.SetReadDeadline(time.Now().Add(8 * time.Second))
 		return conn.WriteMessage(websocket.PongMessage, nil)
 	})
 
+	_ = conn.SetReadDeadline(time.Now().Add(8 * time.Second))
 	for {
 		_, _, err := conn.ReadMessage()
 		if err != nil {

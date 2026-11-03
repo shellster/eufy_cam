@@ -54,4 +54,7 @@ connection_type = 2
 # Streams auto-start on connect, teardown after last client leaves (30s grace).
 # enabled = true
 # port = 8090
-# bind = "0.0.0.0"
+# Address the stream port binds to. Default: "127.0.0.1" — the port is
+# UNAUTHENTICATED, so it only listens on loopback unless you explicitly
+# expose it (e.g. "0.0.0.0" or a specific interface IP for an NVR).
+# bind = "127.0.0.1"
