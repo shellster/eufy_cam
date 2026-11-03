@@ -170,7 +170,9 @@ Because existing tools had subtle bugs and were written in NodeJS which made the
 
 - 1.0.3 May 8th 2026:  Add server stream feature, clean-up some dumb LLM garbage.
 
-- 1.0.4 May 14th 2026: Fix video stream smearing/stalling (PTS mangling, keyframe index bug, videoStates data race). Add configurable P2P timeouts for internet/cloud relay connections.
+- 1.0.4 May 14th 2026:  Fix video stream smearing/stalling (PTS mangling, keyframe index bug, videoStates data race). Add configurable P2P timeouts for internet/cloud relay connections.
+
+- 1.0.5 Nov 3rd 2026:  Support H.265 streaming cameras, which should mean most if not all Eufy cameras / doorbells / pan-and-tilt, etc are now working.  Major improvements to the streaming resiliency.  Cameras should stream more consistently and the streams should glitch and fail less often.  A bunch of improvements to the UX as well to clean it up and properly display camera models.
 
 ## Credit
 
