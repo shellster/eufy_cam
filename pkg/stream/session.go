@@ -12,11 +12,17 @@ import (
 const maxFrames = 100
 const maxBufferBytes = 4 * 1024 * 1024 // 4MB
 
-// StaleThreshold is how long without frames before the feed is considered
-// dead. Must comfortably exceed camera warm-up time after a restart (battery
-// cameras can take several seconds to start sending video) and normal
-// inter-frame jitter, but still recover in a reasonable time.
+// StaleThreshold is how long without frames before an ESTABLISHED feed
+// (one that has produced at least one frame) is considered dead.
 const StaleThreshold = 8 * time.Second
+
+// WarmUpStaleThreshold is how long a stream may take to produce its FIRST
+// frame. Battery/solar cameras (SoloCam S340/E42, battery doorbells) sleep
+// and must wake on demand, which routinely takes 10-30s. The old fixed 8s
+// threshold declared sleeping cameras stale and churn-restarted the P2P
+// session in a loop, so the camera never finished waking and the web app
+// never showed video.
+const WarmUpStaleThreshold = 40 * time.Second
 
 // maxPTSJumpMs bounds how far the camera timestamp may jump forward between
 // frames before it is treated as a clock change and rebased.
@@ -45,13 +51,28 @@ func (s *StreamSession) isStaleLocked() bool {
 	if s.LastUpdate == 0 {
 		return false
 	}
-	return time.Since(time.UnixMilli(s.LastUpdate)) > StaleThreshold
+	elapsed := time.Since(time.UnixMilli(s.LastUpdate))
+	// A camera that has never produced a frame may still be waking up
+	// (battery/solar models sleep until commanded). Give it the full
+	// warm-up budget before declaring it dead.
+	if !s.everHadFrame {
+		return elapsed > WarmUpStaleThreshold
+	}
+	return elapsed > StaleThreshold
 }
 
 func (s *StreamSession) ResetLastUpdate() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.LastUpdate = time.Now().UnixMilli()
+}
+
+// CurrentCodec returns the detected codec under lock. Codec is written by
+// AppendFrame, so readers must not access the field directly.
+func (s *StreamSession) CurrentCodec() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Codec
 }
 
 // NeedsRestart reports whether the upstream feed is dead (stale) or producing
@@ -105,6 +126,7 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 	defer s.mu.Unlock()
 
 	s.LastUpdate = time.Now().UnixMilli()
+	s.everHadFrame = true
 
 	// Validate the bitstream before buffering: once this camera has been
 	// PROVEN to emit Annex-B frames (one valid frame seen), subsequent frames
@@ -130,16 +152,25 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 	}
 
 	if s.Codec == 0 {
-		detected := p2p.GetVideoCodec(frameData)
-		if detected == p2p.VideoCodecH265 {
-			s.Codec = 2
-		} else if detected == p2p.VideoCodecH264 {
+		// The camera reports its codec directly in the frame header
+		// (0=H.264, 1=H.265). Older code assumed StreamType==2 meant H.265
+		// (the CMD_SET_PAYLOAD numbering) — that check never matched the
+		// frame-header values, so H.265 cameras (SoloCam S340/E42 and other
+		// pan-tilt models) fell through to H.264 and produced unplayable TS.
+		switch metadata.StreamType {
+		case 0:
 			s.Codec = 1
-		} else if metadata.StreamType == 2 {
+		case 1:
 			s.Codec = 2
+		default:
+			if detected := p2p.GetVideoCodec(frameData); detected == p2p.VideoCodecH265 {
+				s.Codec = 2
+			} else if detected == p2p.VideoCodecH264 {
+				s.Codec = 1
+			}
 		}
 		if s.Codec != 0 {
-			debuglog.Debugf("StreamSession: detected codec %d for %s", s.Codec, s.DeviceSN)
+			debuglog.Debugf("StreamSession: detected codec %d for %s (frame streamType=%d)", s.Codec, s.DeviceSN, metadata.StreamType)
 		}
 	}
 
@@ -276,13 +307,6 @@ func (s *StreamSession) ClearBuffer() {
 	// before serving anything.
 	s.awaitKeyframe = true
 	s.noKeyFrameSince = time.Now().UnixMilli()
-}
-
-func (s *StreamSession) IsActive() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.LastUpdate > 0
 }
 
 func (s *StreamSession) FrameCount() int {

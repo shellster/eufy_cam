@@ -11,7 +11,7 @@ var testNAL = []byte{0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f, 0xda, 0x05, 0x01}
 
 func newTestSession(t *testing.T, sn string) *StreamSession {
 	t.Helper()
-	t.Cleanup(func() { _ = StopStream(sn) })
+	t.Cleanup(func() { _ = StopStream(sn, 0) })
 	return StartStream(sn, "STATION", 0, 0)
 }
 

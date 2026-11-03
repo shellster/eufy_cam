@@ -7,14 +7,13 @@ import (
 	"net"
 	"strconv"
 	"strings"
+
+	"github.com/shellster/eufy_cam/pkg/crypto"
 )
 
 const (
-	MagicWord            = "XZYH"
-	SendHeaderBytes      = 10
-	RecvDataHeaderOffset = 20
-	MaxPacketBytes       = 1024
-	MaxPayloadBytes      = 1028
+	MagicWord       = "XZYH"
+	SendHeaderBytes = 10
 )
 
 type P2PMessageType uint16
@@ -38,18 +37,18 @@ const (
 	MessageTypeEND                  P2PMessageType = 0xf1f0
 
 	// Response message types
-	MessageTypeLOOKUP_ADDR          P2PMessageType = 0xf140
-	MessageTypeCAM_ID               P2PMessageType = 0xf142
-	MessageTypeCAM_ID2              P2PMessageType = 0xf143
-	MessageTypeLOOKUP_ADDR2         P2PMessageType = 0xf182
-	MessageTypeTURN_SERVER_CAM_ID   P2PMessageType = 0xf184
-	MessageTypeTURN_SERVER_LIST     P2PMessageType = 0xf169
-	MessageTypeTURN_SERVER_OK       P2PMessageType = 0xf171
-	MessageTypeTURN_SERVER_TOKEN    P2PMessageType = 0xf173
+	MessageTypeLOOKUP_ADDR           P2PMessageType = 0xf140
+	MessageTypeCAM_ID                P2PMessageType = 0xf142
+	MessageTypeCAM_ID2               P2PMessageType = 0xf143
+	MessageTypeLOOKUP_ADDR2          P2PMessageType = 0xf182
+	MessageTypeTURN_SERVER_CAM_ID    P2PMessageType = 0xf184
+	MessageTypeTURN_SERVER_LIST      P2PMessageType = 0xf169
+	MessageTypeTURN_SERVER_OK        P2PMessageType = 0xf171
+	MessageTypeTURN_SERVER_TOKEN     P2PMessageType = 0xf173
 	MessageTypeTURN_SERVER_LOOKUP_OK P2PMessageType = 0xf181
-	MessageTypeSTUN_RESP            P2PMessageType = 0xf101
-	MessageTypeLOOKUP_RESP          P2PMessageType = 0xf121
-	MessageTypeLOCAL_LOOKUP_RESP    P2PMessageType = 0xf141
+	MessageTypeSTUN_RESP             P2PMessageType = 0xf101
+	MessageTypeLOOKUP_RESP           P2PMessageType = 0xf121
+	MessageTypeLOCAL_LOOKUP_RESP     P2PMessageType = 0xf141
 )
 
 type P2PDataType byte
@@ -186,45 +185,36 @@ func BuildCommandHeader(seq uint16, commandType uint16, dataType P2PDataType) []
 }
 
 // BuildIntCommandPayload builds a command payload with an integer value.
-func BuildIntCommandPayload(encryptionType int, encryptionKey []byte, commandType uint16, value uint32, strValue string, channel byte) []byte {
+func BuildIntCommandPayload(encryptionType int, encryptionKey []byte, commandType uint16, value uint32, strValue string, channel byte) ([]byte, error) {
 	emptyBuf := []byte{0x00, 0x00}
 	magicBuf := []byte{0x01, 0x00}
 
-	encrypted := isP2PCommandEncrypted(CommandType(commandType)) && encryptionType != 0 && len(encryptionKey) == 16
-	encryptionFlag := byte(0)
-	if encrypted {
-		encryptionFlag = byte(encryptionType)
+	encrypted, dataBuf, err := encryptP2PPayload(isP2PCommandEncrypted(CommandType(commandType)), encryptionType, encryptionKey, intCommandValueData(value, strValue))
+	if err != nil {
+		return nil, err
 	}
 
-	channelBuf := []byte{channel, encryptionFlag}
-
-	valueBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(valueBuf, value)
-
-	strValueBuf := []byte{}
-	if strValue != "" {
-		strValueBuf = stringWithLength(strValue, 128)
-	}
-
-	dataBuf := append(valueBuf, strValueBuf...)
-
-	if encrypted {
-		dataBuf = padP2PData(dataBuf, aes.BlockSize)
-		dataBuf = encryptECB(dataBuf, encryptionKey)
-	}
-
-	headerBuf := make([]byte, 2)
-	binary.LittleEndian.PutUint16(headerBuf, uint16(len(dataBuf)))
+	channelBuf := channelAndFlag(channel, encrypted, encryptionType)
 
 	result := make([]byte, 0)
-	result = append(result, headerBuf...)
+	result = append(result, dataLenHeader(len(dataBuf))...)
 	result = append(result, emptyBuf...)
 	result = append(result, magicBuf...)
 	result = append(result, channelBuf...)
 	result = append(result, emptyBuf...)
 	result = append(result, dataBuf...)
 
-	return result
+	return result, nil
+}
+
+func intCommandValueData(value uint32, strValue string) []byte {
+	valueBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(valueBuf, value)
+
+	if strValue == "" {
+		return valueBuf
+	}
+	return append(valueBuf, stringWithLength(strValue, 128)...)
 }
 
 // BuildVoidCommandPayload builds a void command payload.
@@ -239,39 +229,55 @@ func BuildVoidCommandPayload(channel byte) []byte {
 // When encrypted: data is zero-padded to 16-byte boundary, then AES-128-ECB encrypted.
 // encFlag: 0=plaintext, 1=LEVEL_1, 2=LEVEL_2.
 // Node.js reference: buildCommandWithStringTypePayload in utils.ts
-func BuildCommandWithStringTypePayload(encryptionType int, encryptionKey []byte, commandType uint16, value string, channel byte) []byte {
+func BuildCommandWithStringTypePayload(encryptionType int, encryptionKey []byte, commandType uint16, value string, channel byte) ([]byte, error) {
 	emptyBuf := []byte{0x00, 0x00}
 	magicBuf := []byte{0x01, 0x00}
 
-	encrypted := isP2PCommandEncrypted(CommandType(commandType)) && encryptionType != 0 && len(encryptionKey) == 16
-
-	encFlag := byte(0)
-	if encrypted {
-		encFlag = byte(encryptionType)
+	encrypted, dataBuf, err := encryptP2PPayload(isP2PCommandEncrypted(CommandType(commandType)), encryptionType, encryptionKey, []byte(value))
+	if err != nil {
+		return nil, err
 	}
 
-	channelBuf := []byte{channel, encFlag}
-
-	var dataBuffer []byte
-	if encrypted {
-		dataBuffer = padP2PData([]byte(value), aes.BlockSize)
-		dataBuffer = encryptECB(dataBuffer, encryptionKey)
-	} else {
-		dataBuffer = []byte(value)
-	}
-
-	headerBuf := make([]byte, 2)
-	binary.LittleEndian.PutUint16(headerBuf, uint16(len(dataBuffer)))
+	channelBuf := channelAndFlag(channel, encrypted, encryptionType)
 
 	result := make([]byte, 0)
-	result = append(result, headerBuf...)
+	result = append(result, dataLenHeader(len(dataBuf))...)
 	result = append(result, emptyBuf...)
 	result = append(result, magicBuf...)
 	result = append(result, channelBuf...)
 	result = append(result, emptyBuf...)
-	result = append(result, dataBuffer...)
+	result = append(result, dataBuf...)
 
-	return result
+	return result, nil
+}
+
+// encryptP2PPayload zero-pads and AES-128-ECB encrypts the data when the
+// command requires it and a usable key is available.
+func encryptP2PPayload(cmdEncrypted bool, encryptionType int, encryptionKey []byte, data []byte) (bool, []byte, error) {
+	if !cmdEncrypted || encryptionType == 0 || len(encryptionKey) != 16 {
+		return false, data, nil
+	}
+
+	padded := crypto.PadToBlockSize(data, aes.BlockSize)
+	encrypted, err := crypto.EncryptECB(padded, encryptionKey)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to encrypt command payload: %w", err)
+	}
+	return true, encrypted, nil
+}
+
+func channelAndFlag(channel byte, encrypted bool, encryptionType int) []byte {
+	encFlag := byte(0)
+	if encrypted {
+		encFlag = byte(encryptionType)
+	}
+	return []byte{channel, encFlag}
+}
+
+func dataLenHeader(dataLen int) []byte {
+	headerBuf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(headerBuf, uint16(dataLen))
+	return headerBuf
 }
 
 func isP2PCommandEncrypted(cmd CommandType) bool {
@@ -289,46 +295,6 @@ func isP2PCommandEncrypted(cmd CommandType) bool {
 		1708: true, 1709: true,
 	}
 	return encryptedCmds[cmd]
-}
-
-func padP2PData(data []byte, blockSize int) []byte {
-	if len(data) < blockSize {
-		padded := make([]byte, blockSize)
-		copy(padded, data)
-		return padded
-	}
-	roundUp := ((len(data) + blockSize - 1) / blockSize) * blockSize
-	padded := make([]byte, roundUp)
-	copy(padded, data)
-	return padded
-}
-
-func encryptECB(data, key []byte) []byte {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return data
-	}
-	encrypted := make([]byte, len(data))
-	for i := 0; i < len(data); i += aes.BlockSize {
-		block.Encrypt(encrypted[i:i+aes.BlockSize], data[i:i+aes.BlockSize])
-	}
-	return encrypted
-}
-
-func decryptECB(data, key []byte) []byte {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return data
-	}
-	decrypted := make([]byte, len(data))
-	for i := 0; i < len(data); i += aes.BlockSize {
-		block.Decrypt(decrypted[i:i+aes.BlockSize], data[i:i+aes.BlockSize])
-	}
-	return decrypted
-}
-
-func DecryptECBPayload(data, key []byte) []byte {
-	return decryptECB(data, key)
 }
 
 // BuildAck builds an ACK packet payload.

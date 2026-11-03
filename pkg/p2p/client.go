@@ -17,20 +17,14 @@ import (
 	"time"
 
 	"github.com/shellster/eufy_cam/pkg/api"
+	"github.com/shellster/eufy_cam/pkg/crypto"
 	debuglog "github.com/shellster/eufy_cam/pkg/log"
 )
 
 const (
-	DefaultPort          = 32108
-	MaxRetries           = 10
-	MaxConnectionTimeout = 25 * time.Second
-	MaxAckTimeout        = 5 * time.Second
-	MaxLookupTimeout     = 20 * time.Second
-	HeartbeatInterval    = 3 * time.Second
-	KeepaliveInterval    = 2 * time.Second
-	MaxStreamDataWait    = 5 * time.Second
-	MaxSequenceNumber    = 65535
-	SequenceBoundary     = 20000
+	DefaultPort       = 32108
+	MaxSequenceNumber = 65535
+	HeartbeatInterval = 3 * time.Second
 
 	// videoResyncThreshold is how long a sequence gap is tolerated (waiting for
 	// reordered packets to arrive) before we declare packet loss and resync.
@@ -89,6 +83,14 @@ type Client struct {
 	videoStates         map[byte]*VideoFrameState
 	lastVideoChannel    byte
 	lastVideoPacketTime time.Time
+	// lastVideoAdvance is when the expected sequence number LAST advanced.
+	// Loss resync must be driven by lack of progress, not by packet arrivals:
+	// after a lost packet the station retransmits its predecessor forever, and
+	// those duplicates keep lastVideoPacketTime fresh, which previously
+	// prevented the resync from ever firing (permanent stall on any lossy /
+	// relayed connection).
+	lastVideoAdvance    time.Time
+	duplicateStreak     int
 
 	encryption      EncryptionType
 	p2pKey          []byte
@@ -112,7 +114,7 @@ type Client struct {
 	mu     sync.Mutex
 }
 
-type StreamCallback func(deviceSN string, frameData []byte, metadata VideoFrameMetadata) error
+type StreamCallback func(deviceSN string, channel byte, frameData []byte, metadata VideoFrameMetadata) error
 
 type videoRoute struct {
 	deviceSN string
@@ -824,6 +826,39 @@ func (c *Client) handleVideoMessage(dtIdx int, seqNo uint16, data []byte) {
 	if isSeqBefore(seqNo, expected) {
 		// Duplicate or very late packet: already processed, drop it.
 		debuglog.Debugf("P2P: dropping duplicate video packet seq=%d expected=%d", seqNo, expected)
+
+		// LOSS RESYNC: a duplicate means the station is stuck in go-back-N
+		// retransmit because the packet we EXPECT was lost. Duplicates keep
+		// arriving forever (and keep lastVideoPacketTime fresh), so the
+		// ahead-of-gap resync below never fires — resync on lack of progress
+		// here instead, or the pipeline stalls until the stale monitor kills
+		// the whole stream (observed on relayed/remote connections).
+		c.duplicateStreak++
+		if time.Since(c.lastVideoAdvance) > videoResyncThreshold || c.duplicateStreak >= 3 {
+			debuglog.Debugf("P2P: video loss resync dt=%d (expected=%d, dup streak=%d)",
+				dtIdx, expected, c.duplicateStreak)
+			c.lastVideoAdvance = time.Now()
+			c.duplicateStreak = 0
+
+			// Skip to any queued-ahead packets first (they are real data).
+			c.resyncVideoQueue(dtIdx)
+
+			// If nothing is queued, abandon the lost packet so the next
+			// fresh packet from the station is accepted. Frame reassembly
+			// resets: continuity across the gap is impossible anyway.
+			// NEVER move expected backward: after an earlier resync already
+			// skipped ahead, a stale duplicate must not regress it.
+			c.mu.Lock()
+			next := incrementSequence(seqNo)
+			if c.expectedSeqNo[dtIdx] == expected && isSeqBefore(c.expectedSeqNo[dtIdx], next) {
+				c.expectedSeqNo[dtIdx] = next
+				for ch := range c.videoStates {
+					c.videoStates[ch] = &VideoFrameState{}
+				}
+				debuglog.Debugf("P2P: advanced past lost packet to seq=%d", next)
+			}
+			c.mu.Unlock()
+		}
 		return
 	}
 
@@ -868,6 +903,8 @@ func (c *Client) processVideoInOrder(dtIdx int, seqNo uint16, data []byte) {
 	}
 
 	c.lastVideoPacketTime = time.Now()
+	c.lastVideoAdvance = time.Now()
+	c.duplicateStreak = 0
 }
 
 // resyncVideoQueue recovers from packet loss: skip the expected sequence to
@@ -1195,7 +1232,7 @@ func (c *Client) handleVideoData(seqNo uint16, header P2PDataHeader, data []byte
 			metadata.VideoWidth, metadata.VideoHeight, len(frameData), header.signCode)
 
 		if cb != nil {
-			if err := cb(deviceSN, frameData, metadata); err != nil {
+			if err := cb(deviceSN, header.channel, frameData, metadata); err != nil {
 				debuglog.Debugf("P2P: video callback error: %v", err)
 			}
 		}
@@ -1216,7 +1253,11 @@ func (c *Client) handleCommandData(seqNo uint16, header P2PDataHeader, data []by
 		c.mu.Unlock()
 
 		if enc != EncryptionTypeNone && len(p2pKey) == 16 && len(data) >= aes.BlockSize {
-			decrypted := DecryptECBPayload(data, p2pKey)
+			decrypted, err := crypto.DecryptECBRaw(data, p2pKey)
+			if err != nil {
+				debuglog.Debugf("P2P: failed to decrypt command data: %v", err)
+				return
+			}
 			data = decrypted
 		}
 	}
@@ -1245,7 +1286,7 @@ func (c *Client) handleGatewayInfo(data []byte) {
 	}
 
 	cipherID := binary.LittleEndian.Uint16(data[0:2])
-	encryptedKey := readNullTerminated(data[4:])
+	encryptedKey := []byte(crypto.ReadNullTerminatedString(data[4:]))
 
 	debuglog.Debugf("P2P: GATEWAYINFO cipherID=%d encryptedKeyLen=%d", cipherID, len(encryptedKey))
 
@@ -1284,7 +1325,7 @@ func (c *Client) setupEncryptionFallback() {
 	c.encryption = EncryptionTypeLevel1
 	c.p2pKey = []byte(key)
 	c.mu.Unlock()
-	debuglog.Debugf("P2P: Encryption LEVEL_1 set, key=%s (len=%d)", key, len(key))
+	debuglog.Debugf("P2P: Encryption LEVEL_1 set (keyLen=%d)", len(key))
 	c.signalEncryptionReady()
 }
 
@@ -1298,23 +1339,8 @@ func (c *Client) signalEncryptionReady() {
 	c.sendQueuedMessage()
 }
 
-func readNullTerminated(data []byte) []byte {
-	for i, b := range data {
-		if b == 0 {
-			return data[:i]
-		}
-	}
-	return data
-}
-
 func decryptP2PKeyWithCipher(encryptedKey []byte, privateKeyPEM string) ([]byte, error) {
-	pemData := privateKeyPEM
-	// Strip newlines that may interfere
-	pemData = strings.ReplaceAll(pemData, "\n", "")
-	pemData = strings.ReplaceAll(pemData, "\r", "")
-	// Re-add proper PEM formatting
-	if !strings.Contains(pemData, "-----BEGIN") {
-		// No PEM headers at all
+	if !strings.Contains(privateKeyPEM, "-----BEGIN") {
 		return nil, fmt.Errorf("private key has no PEM headers")
 	}
 
@@ -1365,7 +1391,10 @@ func (c *Client) SendCommandWithInt(commandType CommandType, channel byte, value
 	p2pKey := c.p2pKey
 	c.mu.Unlock()
 
-	payload := BuildIntCommandPayload(int(encType), p2pKey, uint16(commandType), value, "", channel)
+	payload, err := BuildIntCommandPayload(int(encType), p2pKey, uint16(commandType), value, "", channel)
+	if err != nil {
+		return err
+	}
 	return c.SendCommand(commandType, channel, payload)
 }
 
@@ -1380,7 +1409,10 @@ func (c *Client) SendCommandWithStringPayload(commandType CommandType, channel b
 		return fmt.Errorf("no remote address")
 	}
 
-	payload := BuildCommandWithStringTypePayload(int(encType), p2pKey, uint16(commandType), value, channel)
+	payload, err := BuildCommandWithStringTypePayload(int(encType), p2pKey, uint16(commandType), value, channel)
+	if err != nil {
+		return err
+	}
 	return c.SendCommand(commandType, channel, payload)
 }
 
@@ -1506,23 +1538,6 @@ func (c *Client) SetVideoCallback(deviceSN string, channel byte, callback Stream
 		debuglog.Debugf("P2P: channel %d collision: replacing %s with %s", channel, existing.deviceSN, deviceSN)
 	}
 	c.videoRoutes[channel] = &videoRoute{deviceSN: deviceSN, callback: callback}
-}
-
-func (c *Client) ClearVideoCallback() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.videoRoutes = make(map[byte]*videoRoute)
-}
-
-func (c *Client) ClearVideoCallbackForDevice(deviceSN string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for ch, route := range c.videoRoutes {
-		if route.deviceSN == deviceSN {
-			delete(c.videoRoutes, ch)
-			delete(c.videoStates, ch)
-		}
-	}
 }
 
 func (c *Client) handleTurnServerOK(payload []byte, raddr *net.UDPAddr) {

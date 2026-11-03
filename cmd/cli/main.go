@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -163,6 +164,203 @@ func lookupChannel(serverURL, user, pass, deviceSN string) (int, error) {
 	return 0, fmt.Errorf("camera %s not found", deviceSN)
 }
 
+// wsHeartbeat owns the WebSocket connection: all writes are mutex-guarded
+// (gorilla/websocket forbids concurrent writers — unguarded cleanup closes
+// raced the ping ticker and panicked), and shutdown is idempotent (double
+// close(done) panicked before).
+type wsHeartbeat struct {
+	conn   *websocket.Conn
+	done   chan struct{}
+	once   sync.Once
+	wmu    sync.Mutex
+	onStop func()
+}
+
+func dialHeartbeat(serverURL, user, pass, deviceSN string) (*wsHeartbeat, error) {
+	wsStr := wsURL(serverURL, fmt.Sprintf("/api/stream/ws/%s", deviceSN))
+	conn, err := dialWebSocket(wsStr, user, pass)
+	if err != nil {
+		return nil, err
+	}
+	return &wsHeartbeat{conn: conn, done: make(chan struct{})}, nil
+}
+
+func (h *wsHeartbeat) write(msgType int, data []byte) error {
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	return h.conn.WriteMessage(msgType, data)
+}
+
+// start pings every 3s. The server enforces an 8s read deadline that is
+// refreshed by these messages; missing it disconnects the watcher and, after
+// a grace period, stops the livestream server-side.
+func (h *wsHeartbeat) start() {
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := h.write(websocket.TextMessage, []byte("ping")); err != nil {
+					return
+				}
+			case <-h.done:
+				return
+			}
+		}
+	}()
+}
+
+func (h *wsHeartbeat) closed() bool {
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *wsHeartbeat) close() {
+	h.once.Do(func() {
+		close(h.done)
+		_ = h.write(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		_ = h.conn.Close()
+		if h.onStop != nil {
+			h.onStop()
+		}
+	})
+}
+
+// startStream POSTs the stream start endpoint and validates the response.
+func startStream(client *http.Client, serverURL, deviceSN string, channel int) error {
+	startURL := fmt.Sprintf("%s/api/stream/start/%s?channel=%d", serverURL, deviceSN, channel)
+	resp, err := client.Post(startURL, "", nil)
+	if err != nil {
+		return fmt.Errorf("error starting stream: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("failed to start stream (HTTP %d): %s", resp.StatusCode, body)
+	}
+	return nil
+}
+
+func stopStreamViaAPI(client *http.Client, serverURL, user, pass, deviceSN string) {
+	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/stream/stop/%s", serverURL, deviceSN), nil)
+	resp, err := client.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+}
+
+func waitOrDone(d time.Duration, done <-chan struct{}) bool {
+	t := time.After(d)
+	select {
+	case <-t:
+		return true
+	case <-done:
+		return false
+	}
+}
+
+// pumpStream fetches the MPEG-TS stream and copies it to out, RECONNECTING
+// whenever the server ends the response (P2P feed restart, transient
+// failure). HTTP error bodies are never written to out. A 404 triggers a
+// fresh stream start server-side. Runs until done closes or out fails.
+func pumpStream(client *http.Client, serverURL, deviceSN string, channel int, out io.Writer, done <-chan struct{}) error {
+	streamURL := fmt.Sprintf("%s/api/stream/%s", serverURL, deviceSN)
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	// A blocked io.Copy on the response body is not interruptible by the
+	// done channel alone; cancel the request context so the body read aborts.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
+		if err != nil {
+			return fmt.Errorf("stream request build failed: %w", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "stream fetch error: %v\n", err)
+			if !waitOrDone(backoff, done) {
+				return nil
+			}
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
+
+		switch {
+		case resp.StatusCode == http.StatusOK:
+			// fall through to copy below
+		case resp.StatusCode == http.StatusNotFound:
+			_ = resp.Body.Close()
+			fmt.Fprintln(os.Stderr, "stream not found on server, restarting...")
+			if err := startStream(client, serverURL, deviceSN, channel); err != nil {
+				fmt.Fprintf(os.Stderr, "stream restart failed: %v\n", err)
+			}
+			if !waitOrDone(backoff, done) {
+				return nil
+			}
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		default:
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+			_ = resp.Body.Close()
+			fmt.Fprintf(os.Stderr, "stream fetch failed (HTTP %d): %s\n", resp.StatusCode, body)
+			if !waitOrDone(backoff, done) {
+				return nil
+			}
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
+
+		n, copyErr := io.Copy(out, resp.Body)
+		_ = resp.Body.Close()
+
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+
+		if copyErr != nil {
+			// out is broken (downstream pipe gone) — cannot continue.
+			return copyErr
+		}
+		if n == 0 {
+			if !waitOrDone(backoff, done) {
+				return nil
+			}
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
+		backoff = time.Second
+		fmt.Fprintln(os.Stderr, "stream ended, reconnecting...")
+	}
+}
+
 func doStream(serverURL, user, pass, deviceSN string) error {
 	channel, err := lookupChannel(serverURL, user, pass, deviceSN)
 	if err != nil {
@@ -171,66 +369,28 @@ func doStream(serverURL, user, pass, deviceSN string) error {
 
 	client := httpClient(user, pass)
 
-	// Start stream
-	startURL := fmt.Sprintf("%s/api/stream/start/%s?channel=%d", serverURL, deviceSN, channel)
-	resp, err := client.Post(startURL, "", nil)
+	if err := startStream(client, serverURL, deviceSN, channel); err != nil {
+		return err
+	}
+
+	hb, err := dialHeartbeat(serverURL, user, pass, deviceSN)
 	if err != nil {
-		return fmt.Errorf("error starting stream: %v", err)
+		stopStreamViaAPI(client, serverURL, user, pass, deviceSN)
+		return fmt.Errorf("error connecting WebSocket: %w", err)
 	}
-	_ = resp.Body.Close()
+	hb.onStop = func() { stopStreamViaAPI(client, serverURL, user, pass, deviceSN) }
+	hb.start()
+	defer hb.close()
 
-	if false {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to start stream (HTTP %d): %s", resp.StatusCode, body)
-	}
-
-	// Open WebSocket for heartbeat
-	wsStr := wsURL(serverURL, fmt.Sprintf("/api/stream/ws/%s", deviceSN))
-	wsConn, err := dialWebSocket(wsStr, user, pass)
-	if err != nil {
-		stopStream(serverURL, user, pass, deviceSN)
-		return fmt.Errorf("error connecting WebSocket: %v", err)
-	}
-
-	// Heartbeat goroutine
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if err := wsConn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
-					return
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	// Handle cleanup on signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		cleanup(deviceSN, wsConn, done, serverURL, user, pass)
+		hb.close()
 		os.Exit(0)
 	}()
 
-	// Fetch MPEG-TS stream and write to stdout
-	streamURL := fmt.Sprintf("%s/api/stream/%s", serverURL, deviceSN)
-	streamResp, err := client.Get(streamURL)
-	if err != nil {
-		cleanup(deviceSN, wsConn, done, serverURL, user, pass)
-		return fmt.Errorf("error fetching stream: %v", err)
-	}
-	defer func() { _ = streamResp.Body.Close() }()
-
-	_, _ = io.Copy(os.Stdout, streamResp.Body)
-
-	cleanup(deviceSN, wsConn, done, serverURL, user, pass)
-	return nil
+	return pumpStream(client, serverURL, deviceSN, channel, os.Stdout, hb.done)
 }
 
 // fanWriter fans out data from a single reader to multiple HTTP clients.
@@ -287,115 +447,35 @@ func doStreamServe(serverURL, user, pass, deviceSN string, port int, bind string
 
 	client := httpClient(user, pass)
 
-	// Start stream
-	startURL := fmt.Sprintf("%s/api/stream/start/%s?channel=%d", serverURL, deviceSN, channel)
-	resp, err := client.Post(startURL, "", nil)
+	if err := startStream(client, serverURL, deviceSN, channel); err != nil {
+		return err
+	}
+
+	hb, err := dialHeartbeat(serverURL, user, pass, deviceSN)
 	if err != nil {
-		return fmt.Errorf("error starting stream: %v", err)
+		stopStreamViaAPI(client, serverURL, user, pass, deviceSN)
+		return fmt.Errorf("error connecting WebSocket: %w", err)
 	}
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to start stream (HTTP %d)", resp.StatusCode)
-	}
-
-	// Open WebSocket for heartbeat
-	wsStr := wsURL(serverURL, fmt.Sprintf("/api/stream/ws/%s", deviceSN))
-	wsConn, err := dialWebSocket(wsStr, user, pass)
-	if err != nil {
-		stopStream(serverURL, user, pass, deviceSN)
-		return fmt.Errorf("error connecting WebSocket: %v", err)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if err := wsConn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
-					return
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
+	hb.onStop = func() { stopStreamViaAPI(client, serverURL, user, pass, deviceSN) }
+	hb.start()
+	defer hb.close()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
 		log.Println("Shutting down...")
-		cleanup(deviceSN, wsConn, done, serverURL, user, pass)
+		hb.close()
 		os.Exit(0)
 	}()
 
 	// Fan-out writer for multiple clients
 	fan := &fanWriter{}
 
-	// Start fetching from server in background
+	// Source fetcher: reconnects and restarts the server-side stream as
+	// needed; HTTP error bodies are never forwarded to clients.
 	go func() {
-		streamURL := fmt.Sprintf("%s/api/stream/%s", serverURL, deviceSN)
-		startURL := fmt.Sprintf("%s/api/stream/start/%s?channel=%d", serverURL, deviceSN, channel)
-		backoff := 2 * time.Second
-		maxBackoff := 30 * time.Second
-
-		for {
-			streamResp, err := client.Get(streamURL)
-			if err != nil {
-				log.Printf("Error fetching stream: %v", err)
-				select {
-				case <-done:
-					return
-				case <-time.After(backoff):
-					backoff = min(backoff*2, maxBackoff)
-					continue
-				}
-			}
-
-			if streamResp.StatusCode == http.StatusNotFound {
-				_ = streamResp.Body.Close()
-				log.Println("Stream not found on server, restarting...")
-				startResp, err := client.Post(startURL, "", nil)
-				if err != nil {
-					log.Printf("Error restarting stream: %v", err)
-				} else {
-					_ = startResp.Body.Close()
-				}
-				select {
-				case <-done:
-					return
-				case <-time.After(backoff):
-					backoff = min(backoff*2, maxBackoff)
-					continue
-				}
-			}
-
-			n, _ := io.Copy(fan, streamResp.Body)
-			_ = streamResp.Body.Close()
-
-			select {
-			case <-done:
-				return
-			default:
-			}
-
-			if n == 0 {
-				log.Printf("Stream ended immediately (0 bytes), reconnecting in %v...", backoff)
-				select {
-				case <-done:
-					return
-				case <-time.After(backoff):
-					backoff = min(backoff*2, maxBackoff)
-				}
-				continue
-			}
-
-			backoff = 2 * time.Second
-			log.Println("Stream ended, reconnecting...")
-		}
+		_ = pumpStream(client, serverURL, deviceSN, channel, fan, hb.done)
 	}()
 
 	// HTTP server
@@ -432,7 +512,7 @@ func doStreamServe(serverURL, user, pass, deviceSN string, port int, bind string
 	addr := fmt.Sprintf("%s:%d", bind, port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		cleanup(deviceSN, wsConn, done, serverURL, user, pass)
+		hb.close()
 		return fmt.Errorf("error listening on %s: %v", addr, err)
 	}
 
@@ -449,7 +529,7 @@ func doStreamServe(serverURL, user, pass, deviceSN string, port int, bind string
 				if n := fan.count(); n > 0 {
 					log.Printf("Active clients: %d", n)
 				}
-			case <-done:
+			case <-hb.done:
 				return
 			}
 		}
@@ -498,23 +578,6 @@ func dialWebSocket(wsStr, user, pass string) (*websocket.Conn, error) {
 	header.Set("Authorization", cred.String())
 
 	return wsDial(wsStr, header)
-}
-
-func cleanup(deviceSN string, wsConn *websocket.Conn, done chan struct{}, serverURL, user, pass string) {
-	close(done)
-	_ = wsConn.WriteMessage(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-	wsConn.Close() //nolint:errcheck
-	stopStream(serverURL, user, pass, deviceSN)
-}
-
-func stopStream(serverURL, user, pass, deviceSN string) {
-	client := httpClient(user, pass)
-	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/stream/stop/%s", serverURL, deviceSN), nil)
-	resp, err := client.Do(req)
-	if err == nil {
-		_ = resp.Body.Close()
-	}
 }
 
 func wsURL(server, path string) string {

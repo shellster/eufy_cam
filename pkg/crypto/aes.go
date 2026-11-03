@@ -10,6 +10,10 @@ import (
 )
 
 func EncryptCBC(plaintext []byte, key []byte) (string, error) {
+	if len(key) < aes.BlockSize {
+		return "", fmt.Errorf("key too short for IV: %d bytes", len(key))
+	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", fmt.Errorf("failed to create AES cipher: %w", err)
@@ -26,13 +30,17 @@ func EncryptCBC(plaintext []byte, key []byte) (string, error) {
 }
 
 func DecryptCBCRaw(ciphertext []byte, key []byte) ([]byte, error) {
+	if len(key) < aes.BlockSize {
+		return nil, fmt.Errorf("key too short for IV: %d bytes", len(key))
+	}
+
+	if len(ciphertext)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("ciphertext length %d is not a multiple of the block size", len(ciphertext))
+	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create AES cipher: %w", err)
-	}
-
-	if len(key) < aes.BlockSize {
-		return nil, fmt.Errorf("key too short for IV: %d bytes", len(key))
 	}
 
 	iv := key[:aes.BlockSize]
@@ -125,13 +133,19 @@ func EncryptECB(plaintext []byte, key []byte) ([]byte, error) {
 	return encrypted, nil
 }
 
-func DecryptECB(ciphertext []byte, key []byte) ([]byte, error) {
+// DecryptECBRaw decrypts AES-ECB ciphertext without removing any padding.
+// P2P payloads are zero-padded, not PKCS7-padded, so no unpadding is applied.
+func DecryptECBRaw(ciphertext []byte, key []byte) ([]byte, error) {
 	if len(key) != 16 {
 		return nil, fmt.Errorf("AES-128-ECB requires 16-byte key, got %d", len(key))
 	}
 
 	if len(ciphertext) == 0 {
 		return ciphertext, nil
+	}
+
+	if len(ciphertext)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("ciphertext length %d is not a multiple of the block size", len(ciphertext))
 	}
 
 	block, err := aes.NewCipher(key)
@@ -144,45 +158,7 @@ func DecryptECB(ciphertext []byte, key []byte) ([]byte, error) {
 		block.Decrypt(decrypted[i:i+aes.BlockSize], ciphertext[i:i+aes.BlockSize])
 	}
 
-	// Remove PKCS7 padding
-	return RemovePKCS7Padding(decrypted), nil
-}
-
-func DecryptPKCS7Padding(data []byte, blockSize int) []byte {
-	if len(data) == 0 {
-		return data
-	}
-
-	padding := int(data[len(data)-1])
-	if padding < 1 || padding > blockSize {
-		return data
-	}
-
-	expectedPaddingLen := blockSize - len(data)%blockSize
-	if expectedPaddingLen == 0 {
-		return data
-	}
-
-	if padding != expectedPaddingLen {
-		return data
-	}
-
-	return data[:len(data)-padding]
-}
-
-func StringToNullTerminated(s string, chunkLen int) []byte {
-	buf := []byte(s)
-	bufLen := len(buf)
-
-	if bufLen >= chunkLen {
-		result := make([]byte, bufLen)
-		copy(result, buf)
-		return result
-	}
-
-	result := make([]byte, chunkLen)
-	copy(result, buf)
-	return result
+	return decrypted, nil
 }
 
 func ReadNullTerminatedString(data []byte) string {

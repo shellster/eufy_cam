@@ -10,10 +10,10 @@ import (
 
 type Config struct {
 	Eufy   EufyConfig   `toml:"eufy"`
-	Server ServerConfig  `toml:"server"`
-	P2P    P2PConfig     `toml:"p2p"`
-	Auth   AuthConfig    `toml:"auth"`
-	Stream StreamConfig  `toml:"stream"`
+	Server ServerConfig `toml:"server"`
+	P2P    P2PConfig    `toml:"p2p"`
+	Auth   AuthConfig   `toml:"auth"`
+	Stream StreamConfig `toml:"stream"`
 }
 
 type EufyConfig struct {
@@ -41,7 +41,6 @@ func (a *AuthConfig) IsDigest() bool {
 }
 
 type P2PConfig struct {
-	LocalPort         int `toml:"local_port"`
 	ConnectionType    int `toml:"connection_type"`
 	ConnectionTimeout int `toml:"connection_timeout"`
 	EncryptionTimeout int `toml:"encryption_timeout"`
@@ -93,12 +92,6 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("SERVER_DEBUG"); v != "" {
 		cfg.Server.Debug = v == "1" || v == "true" || v == "yes"
-	}
-	if v := os.Getenv("P2P_LOCAL_PORT"); v != "" {
-		port, err := strconv.Atoi(v)
-		if err == nil {
-			cfg.P2P.LocalPort = port
-		}
 	}
 	if v := os.Getenv("P2P_CONNECTION_TYPE"); v != "" {
 		typ, err := strconv.Atoi(v)
@@ -160,9 +153,6 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080
-	}
-	if cfg.P2P.LocalPort == 0 {
-		cfg.P2P.LocalPort = 0
 	}
 	if cfg.P2P.ConnectionType == 0 {
 		cfg.P2P.ConnectionType = 2 // QUICKEST

@@ -107,6 +107,72 @@ When `signCode > 0` and `dataLength >= 128`:
 - Bytes 22-150: RSA-PKCS1v15 encrypted AES key (128 bytes)
 - Byte 151+: video data, first 128 bytes AES-ECB encrypted with the decrypted key
 
+### streamType IS the codec (0=H.264, 1=H.265)
+
+`streamType` in the frame header directly encodes the codec, matching the
+VideoCodec enum (H264=0, H265=1). Verified live:
+- eufyCam 3C (T8134): streamType=0 (H264)
+- SoloCam S340 / E42 pan-tilt: streamType=1 (**H.265** — these cameras
+  default to H.265; muxing HEVC into an H.264-declared TS makes the stream
+  unplayable, which is the classic "camera streams but shows nothing" bug)
+- Battery Doorbell Plus E340: streamType=0 (H264)
+
+Detect the codec from `metadata.StreamType` FIRST (authoritative), falling
+back to NAL-header sniffing (`GetVideoCodec`) which must handle both 1-byte
+H.264 NAL headers and 2-byte HEVC NAL headers (VPS=32/SPS=33/PPS=34/AUD=35).
+
+## Multi-Lens Devices
+
+Dual-lens devices stream one lens per channel over the same P2P session
+- verified live on the Battery Doorbell Plus E340 (T8214):
+  - main lens    = `device_channel`     (1600x2200 portrait)
+  - package lens = `device_channel + 1` (wide, resolution adapts 1080p/1296p)
+- both lenses stream SIMULTANEOUSLY over one shared P2P connection; a start
+  command on channel N+1 must NOT tear down the existing session
+- NOTE: the SoloCam S340 does NOT expose a lens on channel+1 when managed by
+  a HomeBase (channel+1 yields no frames) — only the doorbell family is
+  dual-lens per channel.
+
+The P2P layer routes frames per channel (`videoRoutes[channel]`), so the
+stream callback carries the channel and sessions are keyed `deviceSN#channel`.
+
+## Battery/Solar Camera Wake-Up + H.265 Web Playback
+
+- Battery/solar cameras (SoloCam S340/E42, battery doorbells) SLEEP until
+  commanded to stream and routinely take 10-30s to wake and deliver the first
+  frame. The stream monitor MUST NOT declare such streams stale during this
+  window (`WarmUpStaleThreshold` = 40s for sessions that never produced a
+  frame, vs 8s for established feeds) or it churn-restarts the P2P session in
+  a loop and the camera never finishes waking - the web app then never shows
+  video.
+- These cameras stream H.265 (`frame streamType=1`). Browsers cannot decode
+  HEVC via MSE, so the web/`/api/stream` path pipes the TS through ffmpeg
+  (libx264 zerolatency) to transcode H.265 -> H.264 on the fly. DO NOT pass
+  `-fflags +nobuffer` to ffmpeg for a pipe input: with it, ffmpeg emits zero
+  bytes for a live MPEG-TS pipe (format probing never completes). Recorders
+  (Frigate) can also consume this transcoded stream.
+- Rapid successive stream requests can put battery cameras in a temporary
+  refuse state: if a camera stops responding to stream requests, stop the
+  stream, wait ~60s, and re-request.
+
+## Sequence Loss Resync (CRITICAL for remote/relayed stations)
+
+Video packets are sequenced. When a packet is LOST, the station go-back-N
+retransmits the PRECEDING packet forever. Those retransmits arrive as
+"duplicates" (seq < expected) and keep the connection's packet-arrival clock
+fresh - so a resync keyed on packet ARRIVALS never fires and the pipeline
+stalls permanently (symptom: one frame at stream start / after each monitor
+restart, camera OSD clock frozen, player recovery-loop forever; remote
+relayed homebases lose packets constantly, local ones rarely).
+
+The resync must be driven by LACK OF PROGRESS (`lastVideoAdvance` = when the
+expected sequence last moved forward), triggered from the duplicate-drop path:
+after `videoResyncThreshold` without an advance (or 3 consecutive duplicate
+drops), skip to the lowest queued packet; if nothing is queued, advance
+expected past the retransmitted packet and reset frame reassembly. NEVER move
+`expectedSeqNo` backward - after an earlier resync skipped ahead, a stale
+retransmit arriving later must not regress it.
+
 ## ACK Handling
 
 ACK messages (msgType 0xf1d1) payload:

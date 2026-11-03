@@ -22,7 +22,6 @@ port = 8080
 # Local UDP port for P2P communication with stations/cameras.
 # 0 = OS picks a random ephemeral port. Default: 0
 # Set a specific port only if you need to configure firewall rules.
-local_port = 0
 
 # How to connect to the station. Default: 2
 #   1 = OnlyLocal  — only connect if station is on the same LAN

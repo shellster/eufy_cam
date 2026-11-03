@@ -20,11 +20,17 @@ type Station struct {
 	apiClient     *api.Client
 	dskKey        string
 	streamClients map[string]*p2p.Client
-	connTimeout   time.Duration
-	encTimeout    time.Duration
-	discAttempts  int
-	ackTimeout    time.Duration
-	mu            sync.Mutex
+	// streamKeys remembers the RSA public-modulus payload used for each
+	// device's stream client so multi-lens starts reuse the same key.
+	streamRSA map[string]*rsa.PrivateKey
+	// streamChannels tracks the lenses currently streaming per device so the
+	// shared P2P client is only closed when the LAST lens stops.
+	streamChannels map[string]map[byte]bool
+	connTimeout    time.Duration
+	encTimeout     time.Duration
+	discAttempts   int
+	ackTimeout     time.Duration
+	mu             sync.Mutex
 }
 
 var (
@@ -34,9 +40,11 @@ var (
 
 func NewStation(apiStation *api.Station) (*Station, error) {
 	return &Station{
-		apiStation:    apiStation,
-		p2pClient:     nil,
-		streamClients: make(map[string]*p2p.Client),
+		apiStation:     apiStation,
+		p2pClient:      nil,
+		streamClients:  make(map[string]*p2p.Client),
+		streamRSA:      make(map[string]*rsa.PrivateKey),
+		streamChannels: make(map[string]map[byte]bool),
 	}, nil
 }
 
@@ -113,6 +121,8 @@ func (s *Station) Disconnect() error {
 		_ = sc.Close()
 	}
 	s.streamClients = make(map[string]*p2p.Client)
+	s.streamRSA = make(map[string]*rsa.PrivateKey)
+	s.streamChannels = make(map[string]map[byte]bool)
 
 	if s.p2pClient == nil {
 		return nil
@@ -122,6 +132,36 @@ func (s *Station) Disconnect() error {
 	s.p2pClient = nil
 
 	return err
+}
+
+// MainConnected reports whether the primary P2P connection is alive.
+// Livestream clients are separate connections and are not consulted.
+func (s *Station) MainConnected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.p2pClient != nil && s.p2pClient.IsConnected()
+}
+
+// ReconnectMain replaces a dead primary P2P connection WITHOUT touching any
+// active livestream clients. Empty arguments fall back to the stored values.
+func (s *Station) ReconnectMain(dskKey string, apiClient *api.Client) error {
+	s.mu.Lock()
+	if dskKey != "" {
+		s.dskKey = dskKey
+	}
+	if apiClient != nil {
+		s.apiClient = apiClient
+	}
+	old := s.p2pClient
+	s.p2pClient = nil
+	s.mu.Unlock()
+
+	if old != nil {
+		_ = old.Close()
+	}
+
+	debuglog.Debugf("Station %s: reconnecting main P2P connection", s.GetSerial())
+	return s.ConnectWithAPI(s.dskKey, s.apiClient)
 }
 
 func (s *Station) SetP2PTimeouts(connTimeout, encTimeout, ackTimeout time.Duration, discAttempts int) {
@@ -148,6 +188,14 @@ func (s *Station) IsConnected() bool {
 	return false
 }
 
+// StartLivestream opens (or reuses) the dedicated P2P connection for a
+// device and starts the realtime stream on the given channel.
+//
+// Multi-lens devices (Battery Doorbell Plus E340, SoloCam S340/E42 pan-tilt)
+// expose one lens per channel - e.g. the E340's main lens on device_channel
+// and its package lens on device_channel+1. Channels of the same device share
+// ONE P2P connection: a start for an already-connected device only registers
+// a video callback for the new channel and sends the start command again.
 func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, callback p2p.StreamCallback) error {
 	s.mu.Lock()
 	dskKey := s.dskKey
@@ -157,15 +205,52 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 	discAttempts := s.discAttempts
 	ackTimeout := s.ackTimeout
 
-	// Close existing stream connection for this camera
-	if sc, ok := s.streamClients[deviceSN]; ok {
-		debuglog.Debugf("StartLivestream: closing existing stream connection for %s", deviceSN)
-		_ = sc.Close()
+	// Multi-lens reuse: if a stream client is already live for this device,
+	// share it instead of tearing it down (which would kill the other lens).
+	existing := s.streamClients[deviceSN]
+	if existing != nil && !existing.IsConnected() {
+		debuglog.Debugf("StartLivestream: existing stream connection for %s is dead, replacing", deviceSN)
+		_ = existing.Close()
 		delete(s.streamClients, deviceSN)
+		delete(s.streamRSA, deviceSN)
+		delete(s.streamChannels, deviceSN)
+		existing = nil
+	}
+	if chs, ok := s.streamChannels[deviceSN]; ok && chs[byte(channel)] {
+		debuglog.Debugf("StartLivestream: channel %d already streaming for %s", channel, deviceSN)
+		s.mu.Unlock()
+		return nil
 	}
 	s.mu.Unlock()
 
-	// Create dedicated P2P connection for this camera's stream
+	ch := byte(channel)
+
+	if existing != nil {
+		// Shared-connection path: register the callback for this lens and
+		// send the start command. The RSA key from the original connect is
+		// kept so per-frame AES decryption stays consistent.
+		debuglog.Debugf("StartLivestream: reusing P2P connection for %s channel %d", deviceSN, channel)
+		existing.SetVideoCallback(deviceSN, ch, callback)
+
+		rsaKey := s.streamRSA[deviceSN]
+		payloadData := livestreamPayload(s.apiStation.Member.AdminUserID, channel, rsaKey)
+		payloadJSON, err := json.Marshal(payloadData)
+		if err != nil {
+			return fmt.Errorf("failed to marshal payload: %w", err)
+		}
+		if err := existing.SendCommandWithStringPayload(p2p.CMD_SET_PAYLOAD, ch, string(payloadJSON)); err != nil {
+			return fmt.Errorf("failed to send start command: %w", err)
+		}
+		s.mu.Lock()
+		if s.streamChannels[deviceSN] == nil {
+			s.streamChannels[deviceSN] = make(map[byte]bool)
+		}
+		s.streamChannels[deviceSN][ch] = true
+		s.mu.Unlock()
+		return nil
+	}
+
+	// Fresh connection path (original behavior).
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return fmt.Errorf("failed to generate RSA key: %w", err)
@@ -195,13 +280,32 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 	}
 	debuglog.Debugf("StartLivestream: encryption ready for %s", deviceSN)
 
-	streamClient.SetVideoCallback(deviceSN, byte(channel), callback)
+	streamClient.SetVideoCallback(deviceSN, ch, callback)
 
 	s.mu.Lock()
 	s.streamClients[deviceSN] = streamClient
+	s.streamRSA[deviceSN] = rsaKey
+	if s.streamChannels[deviceSN] == nil {
+		s.streamChannels[deviceSN] = make(map[byte]bool)
+	}
+	s.streamChannels[deviceSN][ch] = true
 	s.mu.Unlock()
 
-	// Export RSA public key modulus, strip leading byte
+	payloadData := livestreamPayload(s.apiStation.Member.AdminUserID, channel, rsaKey)
+	payloadJSON, err := json.Marshal(payloadData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	debuglog.Debugf("StartLivestream: account_id=%s channel=%d device=%s", s.apiStation.Member.AdminUserID, channel, deviceSN)
+
+	return streamClient.SendCommandWithStringPayload(p2p.CMD_SET_PAYLOAD, ch, string(payloadJSON))
+}
+
+// livestreamPayload builds the CMD_SET_PAYLOAD (1350) JSON for starting a
+// realtime stream. Verified live against eufyCam 3C (H264), SoloCam S340 and
+// SoloCam E42 pan-tilt (H265) and Battery Doorbell Plus E340 (dual-lens).
+func livestreamPayload(accountID string, channel int, rsaKey *rsa.PrivateKey) map[string]interface{} {
 	rsaPubKeyHex := ""
 	if rsaKey != nil {
 		n := rsaKey.N.Bytes()
@@ -209,9 +313,8 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 			rsaPubKeyHex = fmt.Sprintf("%x", n[1:])
 		}
 	}
-
-	payloadData := map[string]interface{}{
-		"account_id": s.apiStation.Member.AdminUserID,
+	return map[string]interface{}{
+		"account_id": accountID,
 		"cmd":        int(p2p.CMD_START_REALTIME_MEDIA),
 		"mChannel":   channel,
 		"mValue3":    int(p2p.CMD_START_REALTIME_MEDIA),
@@ -223,29 +326,33 @@ func (s *Station) StartLivestream(deviceSN string, channel int, videoCodec int, 
 			"streamtype":  1,
 		},
 	}
-
-	payloadJSON, err := json.Marshal(payloadData)
-	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
-	debuglog.Debugf("StartLivestream: account_id=%s channel=%d device=%s", s.apiStation.Member.AdminUserID, channel, deviceSN)
-
-	return streamClient.SendCommandWithStringPayload(p2p.CMD_SET_PAYLOAD, byte(channel), string(payloadJSON))
 }
 
+// StopLivestream stops one lens of a device. The shared P2P connection is
+// only closed when the device's LAST streaming lens stops.
 func (s *Station) StopLivestream(deviceSN string, channel int) error {
 	s.mu.Lock()
 	sc, ok := s.streamClients[deviceSN]
 	if ok {
+		if chs := s.streamChannels[deviceSN]; chs != nil {
+			delete(chs, byte(channel))
+		}
+		last := len(s.streamChannels[deviceSN]) == 0
+		if !last {
+			debuglog.Debugf("StopLivestream: stopping channel %d for %s (client shared)", channel, deviceSN)
+			_ = sc.SendCommandWithInt(p2p.CMD_STOP_REALTIME_MEDIA, byte(channel), uint32(channel))
+			s.mu.Unlock()
+			return nil
+		}
 		delete(s.streamClients, deviceSN)
-	}
-	s.mu.Unlock()
-
-	if !ok {
+		delete(s.streamRSA, deviceSN)
+		delete(s.streamChannels, deviceSN)
+	} else {
+		s.mu.Unlock()
 		debuglog.Debugf("StopLivestream: no stream connection for %s", deviceSN)
 		return nil
 	}
+	s.mu.Unlock()
 
 	debuglog.Debugf("StopLivestream: closing stream connection for %s", deviceSN)
 	_ = sc.SendCommandWithInt(p2p.CMD_STOP_REALTIME_MEDIA, byte(channel), uint32(channel))
@@ -266,9 +373,11 @@ func AddOrUpdateStation(apiStation *api.Station) *Station {
 	}
 
 	station := &Station{
-		apiStation:    apiStation,
-		p2pClient:     nil,
-		streamClients: make(map[string]*p2p.Client),
+		apiStation:     apiStation,
+		p2pClient:      nil,
+		streamClients:  make(map[string]*p2p.Client),
+		streamRSA:      make(map[string]*rsa.PrivateKey),
+		streamChannels: make(map[string]map[byte]bool),
 	}
 
 	activeStations[apiStation.StationSN] = station

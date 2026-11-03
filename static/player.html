@@ -6,7 +6,12 @@
 	<title>Camera Player</title>
 	<style>
 		body { margin: 0; background: #000; overflow: hidden; font-family: sans-serif; }
-		video { width: 100vw; height: calc(100vh - 60px); object-fit: contain; display: block; }
+		#views { display: flex; flex-direction: column; height: 100vh; }
+		video { width: 100%; object-fit: contain; display: block; background: #000; }
+		#views.single video { height: calc(100vh - 60px); }
+		#views.dual { gap: 2px; }
+		#views.dual .view-main video { height: 62vh; }
+		#views.dual .view-package video { height: calc(36vh - 2px); }
 		.overlay { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.8); padding: 8px 12px; z-index: 10; }
 		.overlay button { background: #fff; border: none; padding: 8px 16px; border-radius: 4px; font-weight: 600; cursor: pointer; margin-right: 8px; }
 		.overlay button:hover { background: #ddd; }
@@ -14,10 +19,20 @@
 		.debug { color: #888; font-size: 11px; margin-top: 4px; }
 		.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
 		@keyframes spin { to { transform: rotate(360deg); } }
+		.lens-tag { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.6); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; z-index: 5; }
 	</style>
 </head>
 <body>
-	<video id="video" autoplay playsinline muted></video>
+	<div id="views" class="single">
+		<div class="view-main" style="position: relative;">
+			<div class="lens-tag" id="tag-main">Camera</div>
+			<video id="video-main" autoplay playsinline muted></video>
+		</div>
+		<div class="view-package" id="package-view" style="position: relative; display: none;">
+			<div class="lens-tag">Package Camera</div>
+			<video id="video-package" autoplay playsinline muted></video>
+		</div>
+	</div>
 
 	<div class="overlay">
 		<div class="message" id="message"><span class="spinner"></span>Connecting...</div>
@@ -27,36 +42,16 @@
 
 	<script src="/static/mpegts.min.js"></script>
 	<script>
-		const video = document.getElementById('video');
-		const msgEl = document.getElementById('message');
-		const dbgEl = document.getElementById('debug');
 		const params = new URLSearchParams(window.location.search);
 		const deviceSN = params.get('deviceSN') || window.location.pathname.split('/').pop();
+		const isDual = params.get('dual') === '1';
 
 		const maxRetries = 10;
+		let views = [];
+		let isRecoveringViews = 0;
 
-		let player = null;
-		let statusInterval = null;
-		let heartbeatWs = null;
-		let heartbeatInterval = null;
-		let stallCheckInterval = null;
-		let retryCount = 0;
-
-		let streamStartTime = 0;
-		let lastProgressTime = 0;
-		let lastDecodedFrames = 0;
-		let isRecovering = false;
-
-		let onVideoPlaying = null;
-		let onVideoError = null;
-
-		function dbg(msg) {
-			dbgEl.textContent = msg;
-		}
-
-		function getRetryDelay() {
-			const delay = Math.min(2000 * Math.pow(2, retryCount), 30000);
-			return delay;
+		function getRetryDelay(count) {
+			return Math.min(2000 * Math.pow(2, count), 30000);
 		}
 
 		async function authFetch(url, options) {
@@ -76,207 +71,248 @@
 			}
 		}
 
-		function cleanup() {
-			if (stallCheckInterval) {
-				clearInterval(stallCheckInterval);
-				stallCheckInterval = null;
+		class PlayerView {
+			constructor(id, deviceSN, channel, videoEl, msgEl, isPrimary) {
+				this.id = id;
+				this.deviceSN = deviceSN;
+				this.channel = channel;
+				this.video = videoEl;
+				this.msgEl = msgEl;
+				this.isPrimary = isPrimary;
+				this.maxRetries = maxRetries;
+				this.retryCount = 0;
+				this.isRecovering = false;
+				this.player = null;
+				this.statusInterval = null;
+				this.heartbeatWs = null;
+				this.heartbeatInterval = null;
+				this.stallCheckInterval = null;
+				this.streamStartTime = 0;
+				this.lastProgressTime = 0;
+				this.lastDecodedFrames = 0;
+				this.onVideoPlaying = null;
+				this.onVideoError = null;
 			}
-			if (statusInterval) {
-				clearInterval(statusInterval);
-				statusInterval = null;
-			}
-			if (heartbeatInterval) {
-				clearInterval(heartbeatInterval);
-				heartbeatInterval = null;
-			}
-			if (heartbeatWs) {
-				heartbeatWs.onclose = null;
-				heartbeatWs.close();
-				heartbeatWs = null;
-			}
-			if (player) {
-				try { player.pause(); } catch(e) {}
-				try { player.unload(); } catch(e) {}
-				try { player.detachMediaElement(); } catch(e) {}
-				try { player.destroy(); } catch(e) {}
-				player = null;
-			}
-			if (onVideoPlaying) {
-				video.removeEventListener('playing', onVideoPlaying);
-				onVideoPlaying = null;
-			}
-			if (onVideoError) {
-				video.removeEventListener('error', onVideoError);
-				onVideoError = null;
-			}
-		}
 
-		function initiateRecovery(reason) {
-			if (isRecovering) return;
-			isRecovering = true;
-			retryCount++;
-			console.log(`Recovery #${retryCount}: ${reason}`);
-			cleanup();
-			lastDecodedFrames = 0;
-			lastProgressTime = 0;
-			streamStartTime = 0;
-			if (retryCount > maxRetries) {
-				// Don't give up permanently: pause, reset, and keep trying.
-				msgEl.innerHTML = `<span class="spinner"></span>Stream unstable - pausing 60s before retrying...`;
-				setTimeout(() => {
-					retryCount = 0;
-					isRecovering = false;
-					startStream().catch(e => console.error('startStream failed:', e));
-				}, 60000);
-				return;
-			}
-			const delay = getRetryDelay();
-			msgEl.innerHTML = `<span class="spinner"></span>Recovery #${retryCount} (${delay/1000}s)...`;
-			setTimeout(() => { startStream().catch(e => console.error('startStream failed:', e)); }, delay);
-		}
-
-		function startHeartbeat() {
-			const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-			heartbeatWs = new WebSocket(`${wsProto}//${location.host}/api/stream/ws/${deviceSN}`);
-
-			heartbeatWs.onopen = () => {
-				heartbeatInterval = setInterval(() => {
-					if (heartbeatWs && heartbeatWs.readyState === WebSocket.OPEN) {
-						heartbeatWs.send('ping');
-					}
-				}, 3000);
-			};
-
-			heartbeatWs.onclose = () => {
-				if (heartbeatInterval) {
-					clearInterval(heartbeatInterval);
-					heartbeatInterval = null;
+			dbg(msg) {
+				if (this.isPrimary) {
+					document.getElementById('debug').textContent = `[main] ${msg}`;
 				}
-			};
-		}
+			}
 
-		async function pollStatus() {
-			try {
-				const resp = await authFetch(`/api/stream/status/${deviceSN}`);
-				if (!resp) return;
-				const status = await resp.json();
-				dbg(`stream=${status.active} frames=${status.framesCount} codec=${status.codec} retries=${retryCount}`);
-			} catch (e) {}
-		}
+			setMsg(html) {
+				if (this.isPrimary) this.msgEl.innerHTML = html;
+			}
 
-		async function startStream() {
-			try {
-				if (typeof mpegts === 'undefined') {
-					msgEl.textContent = 'Error: mpegts.js failed to load';
+			cleanup() {
+				if (this.stallCheckInterval) { clearInterval(this.stallCheckInterval); this.stallCheckInterval = null; }
+				if (this.statusInterval) { clearInterval(this.statusInterval); this.statusInterval = null; }
+				if (this.heartbeatInterval) { clearInterval(this.heartbeatInterval); this.heartbeatInterval = null; }
+				if (this.heartbeatWs) { this.heartbeatWs.onclose = null; this.heartbeatWs.close(); this.heartbeatWs = null; }
+				if (this.player) {
+					try { this.player.pause(); } catch(e) {}
+					try { this.player.unload(); } catch(e) {}
+					try { this.player.detachMediaElement(); } catch(e) {}
+					try { this.player.destroy(); } catch(e) {}
+					this.player = null;
+				}
+				if (this.onVideoPlaying) {
+					this.video.removeEventListener('playing', this.onVideoPlaying);
+					this.onVideoPlaying = null;
+				}
+				if (this.onVideoError) {
+					this.video.removeEventListener('error', this.onVideoError);
+					this.onVideoError = null;
+				}
+			}
+
+			// teardown(): player-level failures escalate to a full P2P restart
+			// of this lens when the primary view hits its retry ceiling.
+			initiateRecovery(reason) {
+				if (this.isRecovering) return;
+				this.isRecovering = true;
+				this.retryCount++;
+				console.log(`[${this.id}] Recovery #${this.retryCount}: ${reason}`);
+				this.cleanup();
+				this.lastDecodedFrames = 0;
+				this.lastProgressTime = 0;
+				this.streamStartTime = 0;
+				if (this.retryCount > this.maxRetries) {
+					this.setMsg(`<span class="spinner"></span>Stream unstable - pausing 60s before retrying...`);
+					setTimeout(() => {
+						this.retryCount = 0;
+						this.isRecovering = false;
+						this.start().catch(e => console.error('start failed:', e));
+					}, 60000);
 					return;
 				}
+				const delay = getRetryDelay(this.retryCount);
+				this.setMsg(`<span class="spinner"></span>Recovery #${this.retryCount} (${delay/1000}s)...`);
+				setTimeout(() => { this.start().catch(e => console.error('start failed:', e)); }, delay);
+			}
 
-				if (!mpegts.isSupported()) {
-					msgEl.textContent = 'Error: MSE not supported in this browser';
-					return;
-				}
+			startHeartbeat() {
+				const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+				this.heartbeatWs = new WebSocket(
+					`${wsProto}//${location.host}/api/stream/ws/${this.deviceSN}?channel=${this.channel}`);
 
-				msgEl.innerHTML = '<span class="spinner"></span>Establishing P2P connection...';
-
-				const channel = params.get('channel') || '0';
-				let startResp;
-				try {
-					startResp = await authFetch(`/api/stream/start/${deviceSN}?channel=${channel}`, { method: 'POST' });
-				} catch (e) {
-					console.error('Stream start request failed:', e);
-					initiateRecovery('start request failed: ' + e.message);
-					return;
-				}
-				if (!startResp || !startResp.ok) {
-					const errText = startResp ? await startResp.text() : 'Authentication required';
-					msgEl.textContent = 'Failed to start stream: ' + errText;
-					return;
-				}
-
-				msgEl.innerHTML = '<span class="spinner"></span>Loading video stream...';
-
-				player = mpegts.createPlayer({
-					type: 'mpegts',
-					isLive: true,
-					url: `/api/stream/${deviceSN}`
-				}, {
-					enableWorker: false,
-					enableStashBuffer: false,
-					autoCleanupSourceBuffer: true,
-					lazyLoad: false,
-					liveBufferLatencyChasing: true,
-					liveBufferLatencyChasingOnPaused: true,
-					autoCleanupMaxBackwardDuration: 3,
-					autoCleanupMinBackwardDuration: 2
-				});
-
-				player.attachMediaElement(video);
-
-				player.on(mpegts.Events.ERROR, (errorType, errorDetail, errorInfo) => {
-					console.error('mpegts error:', errorType, errorDetail, errorInfo);
-					initiateRecovery('mpegts error: ' + errorDetail);
-				});
-
-				player.on(mpegts.Events.STATISTICS_INFO, (info) => {
-					const decoded = info.decodedFrames || 0;
-					if (decoded > lastDecodedFrames) {
-						lastDecodedFrames = decoded;
-						lastProgressTime = Date.now();
-					}
-				});
-
-				player.on(mpegts.Events.LOADING_COMPLETE, () => {
-					msgEl.textContent = 'Stream ended';
-				});
-
-				player.load();
-
-				onVideoPlaying = () => {
-					msgEl.textContent = '';
-					retryCount = 0;
-					lastProgressTime = Date.now();
-				};
-				onVideoError = (e) => {
-					console.log('Video element error:', e);
-					initiateRecovery('video element error');
-				};
-				video.addEventListener('playing', onVideoPlaying);
-				video.addEventListener('error', onVideoError);
-
-				player.play().catch(() => {});
-
-				isRecovering = false;
-				streamStartTime = Date.now();
-				lastProgressTime = 0;
-				lastDecodedFrames = 0;
-				msgEl.innerHTML = '<span class="spinner"></span>Buffering...';
-
-				stallCheckInterval = setInterval(() => {
-					if (!player || isRecovering) return;
-					const now = Date.now();
-
-					if (lastProgressTime === 0) {
-						if (now - streamStartTime > 15000) {
-							initiateRecovery('buffering timeout >15s');
+				this.heartbeatWs.onopen = () => {
+					this.heartbeatInterval = setInterval(() => {
+						if (this.heartbeatWs && this.heartbeatWs.readyState === WebSocket.OPEN) {
+							this.heartbeatWs.send('ping');
 						}
+					}, 3000);
+				};
+
+				this.heartbeatWs.onclose = () => {
+					if (this.heartbeatInterval) {
+						clearInterval(this.heartbeatInterval);
+						this.heartbeatInterval = null;
+					}
+				};
+			}
+
+			async pollStatus() {
+				try {
+					const resp = await authFetch(`/api/stream/status/${this.deviceSN}`);
+					if (!resp) return;
+					const status = await resp.json();
+					this.dbg(`stream=${status.active} frames=${status.frameCount} codec=${status.codec} retries=${this.retryCount}`);
+				} catch (e) {}
+			}
+
+			async start() {
+				try {
+					if (typeof mpegts === 'undefined') {
+						this.setMsg('Error: mpegts.js failed to load');
+						return;
+					}
+					if (!mpegts.isSupported()) {
+						this.setMsg('Error: MSE not supported in this browser');
 						return;
 					}
 
-					if (now - lastProgressTime > 10000) {
-						initiateRecovery('no decode progress for 10s');
+					this.setMsg('<span class="spinner"></span>Establishing P2P connection...');
+
+					let startResp;
+					try {
+						startResp = await authFetch(`/api/stream/start/${this.deviceSN}?channel=${this.channel}`, { method: 'POST' });
+					} catch (e) {
+						console.error('Stream start request failed:', e);
+						this.initiateRecovery('start request failed: ' + e.message);
+						return;
 					}
-				}, 3000);
+					if (!startResp || !startResp.ok) {
+						const errText = startResp ? await startResp.text() : 'Authentication required';
+						this.setMsg('Failed to start stream: ' + errText);
+						return;
+					}
 
-				startHeartbeat();
+					this.setMsg('<span class="spinner"></span>Loading video stream...');
 
-				statusInterval = setInterval(pollStatus, 5000);
-				pollStatus();
-			} catch (err) {
-				msgEl.textContent = 'Error: ' + err.message;
+					this.player = mpegts.createPlayer({
+						type: 'mpegts',
+						isLive: true,
+						url: `/api/stream/${this.deviceSN}?channel=${this.channel}`
+					}, {
+						enableWorker: false,
+						enableStashBuffer: false,
+						autoCleanupSourceBuffer: true,
+						lazyLoad: false,
+						liveBufferLatencyChasing: true,
+						liveBufferLatencyChasingOnPaused: true,
+						autoCleanupMaxBackwardDuration: 3,
+						autoCleanupMinBackwardDuration: 2
+					});
+
+					this.player.attachMediaElement(this.video);
+
+					this.player.on(mpegts.Events.ERROR, (errorType, errorDetail, errorInfo) => {
+						console.error('mpegts error:', errorType, errorDetail, errorInfo);
+						this.initiateRecovery('mpegts error: ' + errorDetail);
+					});
+
+					this.player.on(mpegts.Events.STATISTICS_INFO, (info) => {
+						const decoded = info.decodedFrames || 0;
+						if (decoded > this.lastDecodedFrames) {
+							this.lastDecodedFrames = decoded;
+							this.lastProgressTime = Date.now();
+						}
+					});
+
+					this.player.on(mpegts.Events.LOADING_COMPLETE, () => {
+						this.setMsg('Stream ended');
+					});
+
+					this.player.load();
+
+					this.onVideoPlaying = () => {
+						this.setMsg('');
+						this.retryCount = 0;
+						this.lastProgressTime = Date.now();
+					};
+					this.onVideoError = (e) => {
+						console.log('Video element error:', e);
+						this.initiateRecovery('video element error');
+					};
+					this.video.addEventListener('playing', this.onVideoPlaying);
+					this.video.addEventListener('error', this.onVideoError);
+
+					this.player.play().catch(() => {});
+
+					this.isRecovering = false;
+					this.streamStartTime = Date.now();
+					this.lastProgressTime = 0;
+					this.lastDecodedFrames = 0;
+					this.setMsg('<span class="spinner"></span>Buffering...');
+
+					this.stallCheckInterval = setInterval(() => {
+						if (!this.player || this.isRecovering) return;
+						const now = Date.now();
+						if (this.lastProgressTime === 0) {
+							if (now - this.streamStartTime > 15000) {
+								this.initiateRecovery('buffering timeout >15s');
+							}
+							return;
+						}
+						if (now - this.lastProgressTime > 10000) {
+							this.initiateRecovery('no decode progress for 10s');
+						}
+					}, 3000);
+
+					this.startHeartbeat();
+
+					this.statusInterval = setInterval(() => this.pollStatus(), 5000);
+					this.pollStatus();
+				} catch (err) {
+					this.setMsg('Error: ' + err.message);
+				}
 			}
 		}
 
-		startStream().catch(e => console.error('startStream failed:', e));
+		// Build views: single lens = one player; dual-lens devices (e.g. the
+		// E340 doorbell) show the main lens on top and the package lens below,
+		// mirroring the phone app's simultaneous two-lens display.
+		function buildViews() {
+			const viewsEl = document.getElementById('views');
+			const msgEl = document.getElementById('message');
+			const mainChannel = parseInt(params.get('channel') || '0', 10);
+			const list = [new PlayerView('main', deviceSN, mainChannel,
+				document.getElementById('video-main'), msgEl, true)];
+
+			if (isDual) {
+				viewsEl.classList.remove('single');
+				viewsEl.classList.add('dual');
+				document.getElementById('package-view').style.display = 'block';
+				document.getElementById('tag-main').textContent = 'Main Camera';
+				list.push(new PlayerView('package', deviceSN, mainChannel + 1,
+					document.getElementById('video-package'), msgEl, false));
+			}
+			return list;
+		}
+
+		views = buildViews();
+		views.forEach(v => v.start().catch(e => console.error('start failed:', e)));
 	</script>
 </body>
 </html>

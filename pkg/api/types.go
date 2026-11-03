@@ -6,14 +6,14 @@ import (
 )
 
 type Station struct {
-	StationSN   string            `json:"station_sn"`
-	P2PDID      string            `json:"p2p_did"`
-	AppConn      string            `json:"app_conn"`
-	Name        string            `json:"station_name"`
-	Model        string            `json:"model"`
-	HWVersion    string            `json:"hw_version"`
-	SWVersion    string            `json:"sw_version"`
-	Member       StationMember      `json:"member"`
+	StationSN string        `json:"station_sn"`
+	P2PDID    string        `json:"p2p_did"`
+	AppConn   string        `json:"app_conn"`
+	Name      string        `json:"station_name"`
+	Model     string        `json:"station_model"`
+	HWVersion string        `json:"main_hw_version"`
+	SWVersion string        `json:"main_sw_version"`
+	Member    StationMember `json:"member"`
 }
 
 type StationMember struct {
@@ -21,22 +21,22 @@ type StationMember struct {
 }
 
 type Device struct {
-	DeviceSN      string `json:"device_sn"`
-	DeviceType    int    `json:"device_type"`
-	DeviceName    string `json:"device_name"`
-	Channel       int    `json:"device_channel"`
-	StationSN     string `json:"station_sn"`
-	Model         string `json:"model"`
-	HWVersion     string `json:"hw_version"`
-	SWVersion     string `json:"sw_version"`
+	DeviceSN   string `json:"device_sn"`
+	DeviceType int    `json:"device_type"`
+	DeviceName string `json:"device_name"`
+	Channel    int    `json:"device_channel"`
+	StationSN  string `json:"station_sn"`
+	Model      string `json:"device_model"`
+	HWVersion  string `json:"main_hw_version"`
+	SWVersion  string `json:"main_sw_version"`
 }
 
 type LoginResponse struct {
-	AuthToken       string `json:"auth_token"`
-	TokenExpiresAt int64  `json:"token_expires_at"`
-	UserID         string `json:"user_id"`
-	Email          string `json:"email"`
-	NickName       string `json:"nick_name"`
+	AuthToken      string       `json:"auth_token"`
+	TokenExpiresAt int64        `json:"token_expires_at"`
+	UserID         string       `json:"user_id"`
+	Email          string       `json:"email"`
+	NickName       string       `json:"nick_name"`
 	ServerSecret   ServerSecret `json:"server_secret_info"`
 }
 

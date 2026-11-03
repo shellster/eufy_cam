@@ -8,14 +8,20 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
+	"github.com/shellster/eufy_cam/config"
 	"github.com/shellster/eufy_cam/pkg/crypto"
 	debuglog "github.com/shellster/eufy_cam/pkg/log"
-	"github.com/shellster/eufy_cam/config"
 )
 
+// Client talks to the Eufy cloud API. It is used concurrently (login from web
+// handlers, cipher lookups from P2P goroutines), so all mutable state is
+// guarded by mu: exported methods lock and delegate to unexported
+// implementations that assume the lock is held.
 type Client struct {
+	mu           sync.Mutex
 	config       *config.Config
 	apiBase      string
 	token        string
@@ -34,24 +40,29 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		apiBase:    "https://extend.eufylife.com",
 		token:      "",
 		client:     &http.Client{Timeout: 30 * time.Second},
-		privateKey:  "",
+		privateKey: "",
 	}, nil
 }
 
 func (c *Client) Login() error {
-	return c.loginWithCaptcha("", "")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.login("", "")
 }
 
 func (c *Client) LoginWithCaptcha(captchaID, captchaAnswer string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.lastLoginReq != nil {
 		c.lastLoginReq["captcha_id"] = captchaID
 		c.lastLoginReq["answer"] = captchaAnswer
 		return c.postLogin(c.lastLoginReq)
 	}
-	return c.loginWithCaptcha(captchaID, captchaAnswer)
+	return c.login(captchaID, captchaAnswer)
 }
 
-func (c *Client) loginWithCaptcha(captchaID, captchaAnswer string) error {
+func (c *Client) login(captchaID, captchaAnswer string) error {
 	if c.token != "" && c.tokenExpiry.After(time.Now()) {
 		return nil
 	}
@@ -60,25 +71,19 @@ func (c *Client) loginWithCaptcha(captchaID, captchaAnswer string) error {
 		return fmt.Errorf("username and password must be configured")
 	}
 
-	_, timezoneOffset := time.Now().Zone()
-	timezoneOffset = -timezoneOffset / 60
-
 	encPassword, err := c.encryptPassword(c.config.Eufy.Password)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt password: %w", err)
 	}
 
-	loginData := map[string]interface{}{
-		"ab":              c.config.Eufy.Country,
-		"client_secret_info": map[string]string{
-			"public_key": c.publicKey,
-		},
-		"enc":             0,
-		"email":           c.config.Eufy.Username,
-		"password":        encPassword,
-		"time_zone":       -timezoneOffset * 60 * 1000,
-		"transaction":     strconv.FormatInt(time.Now().UnixMilli(), 10),
+	loginData := c.baseParams()
+	loginData["ab"] = c.config.Eufy.Country
+	loginData["client_secret_info"] = map[string]string{
+		"public_key": c.publicKey,
 	}
+	loginData["enc"] = 0
+	loginData["email"] = c.config.Eufy.Username
+	loginData["password"] = encPassword
 
 	if captchaID != "" && captchaAnswer != "" {
 		loginData["captcha_id"] = captchaID
@@ -108,16 +113,16 @@ func (c *Client) postLogin(loginData map[string]interface{}) error {
 
 	switch apiResp.Code {
 	case CodeOK:
-		var loginData LoginResponse
-		if err := json.Unmarshal(apiResp.Data, &loginData); err != nil {
+		var data LoginResponse
+		if err := json.Unmarshal(apiResp.Data, &data); err != nil {
 			return fmt.Errorf("failed to parse login data: %w", err)
 		}
-		c.token = loginData.AuthToken
-		c.tokenExpiry = time.Unix(loginData.TokenExpiresAt, 0)
-		c.userID = loginData.UserID
+		c.token = data.AuthToken
+		c.tokenExpiry = time.Unix(data.TokenExpiresAt, 0)
+		c.userID = data.UserID
 		// Update shared secret with per-session server public key from login response
-		if loginData.ServerSecret.PublicKey != "" {
-			if secret, err := crypto.ComputeSecret(c.privateKey, loginData.ServerSecret.PublicKey); err == nil {
+		if data.ServerSecret.PublicKey != "" {
+			if secret, err := crypto.ComputeSecret(c.privateKey, data.ServerSecret.PublicKey); err == nil {
 				c.sharedSecret = secret
 				debuglog.Debugf("updated sharedSecret from server session key")
 			}
@@ -154,6 +159,47 @@ func (c *Client) postLogin(loginData map[string]interface{}) error {
 		return &LoginError{Code: apiResp.Code, Message: apiResp.Msg}
 	}
 }
+
+// baseParams returns the timezone/transaction boilerplate shared by all
+// cloud API requests.
+func (c *Client) baseParams() map[string]interface{} {
+	_, timezoneOffset := time.Now().Zone()
+	timezoneOffset = -timezoneOffset / 60
+	return map[string]interface{}{
+		"transaction": strconv.FormatInt(time.Now().UnixMilli(), 10),
+		"time_zone":   -timezoneOffset * 60 * 1000,
+	}
+}
+
+// postDecoded runs the shared response pipeline: POST → status → APIResponse
+// → code check → decrypt → trimJSON → unmarshal into out.
+func (c *Client) postDecoded(endpoint string, params map[string]interface{}, out interface{}) error {
+	resp, err := c.post(endpoint, params)
+	if err != nil {
+		return err
+	}
+
+	var apiResp APIResponse
+	if err := json.Unmarshal(resp.Body, &apiResp); err != nil {
+		return fmt.Errorf("failed to parse %s response: %w", endpoint, err)
+	}
+
+	if apiResp.Code != CodeOK {
+		return fmt.Errorf("%s failed: code %d, msg: %s", endpoint, apiResp.Code, apiResp.Msg)
+	}
+
+	decrypted, err := c.decryptAPIResponse(apiResp.Data)
+	if err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(trimJSON(decrypted), out); err != nil {
+		return fmt.Errorf("failed to parse %s data: %w", endpoint, err)
+	}
+
+	return nil
+}
+
 func (c *Client) FetchCaptchaImage(captchaID string) ([]byte, error) {
 	urls := []string{
 		fmt.Sprintf("https://security-app.eufylife.com/v1/captcha/app/get?captcha_id=%s", captchaID),
@@ -229,107 +275,62 @@ func trimJSON(data []byte) []byte {
 }
 
 func (c *Client) GetStations() ([]Station, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.getStations()
+}
+
+func (c *Client) getStations() ([]Station, error) {
 	if !c.isAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
 
-	_, timezoneOffset := time.Now().Zone()
-	timezoneOffset = -timezoneOffset / 60
-
-	data := map[string]interface{}{
-		"device_sn": "",
-		"num":        1000,
-		"orderby":   "",
-		"page":      0,
-		"station_sn": "",
-		"time_zone":  -timezoneOffset * 60 * 1000,
-		"transaction": strconv.FormatInt(time.Now().UnixMilli(), 10),
-	}
-
-	resp, err := c.post("/v2/house/station_list", data)
-	debuglog.Debugf("stations raw response (first 300): %s", string(resp.Body[:min(len(resp.Body), 300)]))
-	if err != nil {
-		return nil, err
-	}
-
-	var apiResp APIResponse
-	if err := json.Unmarshal(resp.Body, &apiResp); err != nil {
-		return nil, fmt.Errorf("failed to parse stations response: %w", err)
-	}
-
-	if apiResp.Code != CodeOK {
-		return nil, fmt.Errorf("get stations failed: code %d, msg: %s", apiResp.Code, apiResp.Msg)
-	}
-
-	debuglog.Debugf("stations data (first 200): %s", string(apiResp.Data[:min(len(apiResp.Data), 200)]))
-	debuglog.Debugf("sharedSecret len=%d first16=%x", len(c.sharedSecret), c.sharedSecret[:min(len(c.sharedSecret), 16)])
-	decrypted, err := c.decryptAPIResponse(apiResp.Data)
-	if err != nil {
-		return nil, err
-	}
-
-	debuglog.Debugf("stations decrypted (first 200): %s", string(decrypted[:min(len(decrypted), 200)]))
-	// Trim trailing garbage after valid JSON
-	decrypted = trimJSON(decrypted)
+	params := c.baseParams()
+	params["device_sn"] = ""
+	params["num"] = 1000
+	params["orderby"] = ""
+	params["page"] = 0
+	params["station_sn"] = ""
 
 	var stations []Station
-	if err := json.Unmarshal(decrypted, &stations); err != nil {
-		return nil, fmt.Errorf("failed to parse stations: %w", err)
+	if err := c.postDecoded("/v2/house/station_list", params, &stations); err != nil {
+		return nil, err
 	}
-
 	return stations, nil
 }
 
 func (c *Client) GetDevices() ([]Device, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.getDevices()
+}
+
+func (c *Client) getDevices() ([]Device, error) {
 	if !c.isAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
 
-	_, timezoneOffset := time.Now().Zone()
-	timezoneOffset = -timezoneOffset / 60
-
-	data := map[string]interface{}{
-		"device_sn": "",
-		"num":        1000,
-		"orderby":   "",
-		"page":      0,
-		"station_sn": "",
-		"time_zone":  -timezoneOffset * 60 * 1000,
-		"transaction": strconv.FormatInt(time.Now().UnixMilli(), 10),
-	}
-
-	resp, err := c.post("/v2/house/device_list", data)
-	if err != nil {
-		return nil, err
-	}
-
-	var apiResp APIResponse
-	if err := json.Unmarshal(resp.Body, &apiResp); err != nil {
-		return nil, fmt.Errorf("failed to parse devices response: %w", err)
-	}
-
-	if apiResp.Code != CodeOK {
-		return nil, fmt.Errorf("get devices failed: code %d", apiResp.Code)
-	}
-
-	debuglog.Debugf("stations data (first 200): %s", string(apiResp.Data[:min(len(apiResp.Data), 200)]))
-	debuglog.Debugf("sharedSecret len=%d first16=%x", len(c.sharedSecret), c.sharedSecret[:min(len(c.sharedSecret), 16)])
-	decrypted, err := c.decryptAPIResponse(apiResp.Data)
-	if err != nil {
-		return nil, err
-	}
-
-	decrypted = trimJSON(decrypted)
+	params := c.baseParams()
+	params["device_sn"] = ""
+	params["num"] = 1000
+	params["orderby"] = ""
+	params["page"] = 0
+	params["station_sn"] = ""
 
 	var devices []Device
-	if err := json.Unmarshal(decrypted, &devices); err != nil {
-		return nil, fmt.Errorf("failed to parse devices: %w", err)
+	if err := c.postDecoded("/v2/house/device_list", params, &devices); err != nil {
+		return nil, err
 	}
-
 	return devices, nil
 }
 
 func (c *Client) GetDSKKeys(stationSN string) (*DSKKey, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.getDSKKeys(stationSN)
+}
+
+func (c *Client) getDSKKeys(stationSN string) (*DSKKey, error) {
 	if !c.isAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
@@ -366,8 +367,7 @@ func (c *Client) GetDSKKeys(stationSN string) (*DSKKey, error) {
 		if decErr != nil {
 			return nil, decErr
 		}
-		decrypted = trimJSON(decrypted)
-		if err := json.Unmarshal(decrypted, &dskResp); err != nil {
+		if err := json.Unmarshal(trimJSON(decrypted), &dskResp); err != nil {
 			return nil, fmt.Errorf("failed to parse DSK keys: %w", err)
 		}
 	}
@@ -382,6 +382,12 @@ func (c *Client) GetDSKKeys(stationSN string) (*DSKKey, error) {
 }
 
 func (c *Client) GetCiphers(cipherIDs []int, userID string) (map[int]*Cipher, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.getCiphers(cipherIDs, userID)
+}
+
+func (c *Client) getCiphers(cipherIDs []int, userID string) (map[int]*Cipher, error) {
 	if !c.isAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
@@ -392,30 +398,9 @@ func (c *Client) GetCiphers(cipherIDs []int, userID string) (map[int]*Cipher, er
 		"transaction": strconv.FormatInt(time.Now().UnixMilli(), 10),
 	}
 
-	resp, err := c.post("/v2/app/cipher/get_ciphers", data)
-	if err != nil {
-		return nil, fmt.Errorf("get ciphers request failed: %w", err)
-	}
-
-	var apiResp APIResponse
-	if err := json.Unmarshal(resp.Body, &apiResp); err != nil {
-		return nil, fmt.Errorf("failed to parse ciphers response: %w", err)
-	}
-
-	if apiResp.Code != CodeOK {
-		return nil, fmt.Errorf("get ciphers failed: code %d", apiResp.Code)
-	}
-
-	decrypted, err := c.decryptAPIResponse(apiResp.Data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt ciphers: %w", err)
-	}
-
-	decrypted = trimJSON(decrypted)
-
 	var ciphersList []Cipher
-	if err := json.Unmarshal(decrypted, &ciphersList); err != nil {
-		return nil, fmt.Errorf("failed to parse ciphers list: %w", err)
+	if err := c.postDecoded("/v2/app/cipher/get_ciphers", data, &ciphersList); err != nil {
+		return nil, err
 	}
 
 	result := make(map[int]*Cipher)
@@ -539,7 +524,7 @@ func (c *Client) post(endpoint string, data map[string]interface{}) (*HTTPRespon
 
 	return &HTTPResponse{
 		StatusCode: resp.StatusCode,
-		Body:      body,
+		Body:       body,
 	}, nil
 }
 

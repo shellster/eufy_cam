@@ -27,7 +27,7 @@ func NewMuxer(w io.Writer, codec Codec) *Muxer {
 	}
 
 	m.muxer.OnPacket = func(pkg []byte) {
-	_, _ = m.w.Write(pkg)
+		_, _ = m.w.Write(pkg)
 	}
 
 	var streamType mpeg2.TS_STREAM_TYPE
@@ -59,26 +59,5 @@ func (m *Muxer) WriteFrame(nalData []byte, ptsMs uint64) error {
 }
 
 func (m *Muxer) Close() {
-	if m.muxer != nil {
-		m.muxer = nil
-	}
+	m.muxer = nil
 }
-
-func CodecFromStreamType(streamType byte) Codec {
-	if streamType == 2 {
-		return CodecH265
-	}
-	return CodecH264
-}
-
-func DetectCodecFromData(data []byte) Codec {
-	if len(data) < 5 {
-		return CodecH264
-	}
-	nalType := data[4] & 0x1F
-	if nalType >= 32 {
-		return CodecH265
-	}
-	return CodecH264
-}
-

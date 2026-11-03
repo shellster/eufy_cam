@@ -46,11 +46,11 @@ func wrapWithInnerHeader(video []byte, totalLen int, channel byte) []byte {
 
 type frameCollector struct {
 	mu     sync.Mutex
-	frames []int          // payload lengths
-	ts     []uint64       // video timestamps
+	frames []int    // payload lengths
+	ts     []uint64 // video timestamps
 }
 
-func (fc *frameCollector) cb(deviceSN string, frameData []byte, metadata VideoFrameMetadata) error {
+func (fc *frameCollector) cb(deviceSN string, channel byte, frameData []byte, metadata VideoFrameMetadata) error {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	fc.frames = append(fc.frames, len(frameData))
