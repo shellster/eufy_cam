@@ -107,6 +107,98 @@ When `signCode > 0` and `dataLength >= 128`:
 - Bytes 22-150: RSA-PKCS1v15 encrypted AES key (128 bytes)
 - Byte 151+: video data, first 128 bytes AES-ECB encrypted with the decrypted key
 
+### streamType IS the codec (0=H.264, 1=H.265)
+
+`streamType` in the frame header directly encodes the codec, matching the
+VideoCodec enum (H264=0, H265=1). Verified live:
+- eufyCam 3C (T8134): streamType=0 (H264)
+- SoloCam S340 / E42 pan-tilt: streamType=1 (**H.265** — these cameras
+  default to H.265; muxing HEVC into an H.264-declared TS makes the stream
+  unplayable, which is the classic "camera streams but shows nothing" bug)
+- Battery Doorbell Plus E340: streamType=0 (H264)
+
+Detect the codec from `metadata.StreamType` FIRST (authoritative), falling
+back to NAL-header sniffing (`GetVideoCodec`) which must handle both 1-byte
+H.264 NAL headers and 2-byte HEVC NAL headers (VPS=32/SPS=33/PPS=34/AUD=35).
+
+### The isKeyFrame header byte is NOT reliable
+
+Pan-tilt cameras (SoloCam S340/E42) never set the `isKeyFrame` flag in the
+frame header, even for real IDR frames. Keyframe detection must scan the
+AU's NALs for IDR/CRA (HEVC nal types 19/20/21, H.264 type 5) — and it must
+walk ALL NALs: keyframe AUs lead with VPS/SPS/PPS/SEI before the IDR slice,
+so checking only the first NAL sees the VPS and misses every keyframe.
+Without this, keyframe-gated serving starves and clients join mid-GOP.
+
+## Multi-Lens Devices
+
+HomeBase channel slots are DEVICE slots, not lens slots. This was verified
+with packet-level content fingerprinting: requesting `device_channel + 1`
+delivers the NEXT DEVICE's feed (96/100 TS packets matched the neighbor
+camera), not a second lens.
+
+Multi-lens cameras deliver ALL lenses composited in ONE stream on the
+device's own channel — verified on the Battery Doorbell Plus E340 (T8214):
+a single portrait 1600x2200 stream = main lens with the package lens view
+stacked below. NEVER add +1 channel starts for a second lens.
+
+The P2P layer routes frames per channel (`videoRoutes[channel]`), so the
+stream callback carries the channel and sessions are keyed `deviceSN#channel`.
+
+## Battery/Solar Camera Wake-Up + H.265 Web Playback
+
+- Battery/solar cameras (SoloCam S340/E42, battery doorbells) SLEEP until
+  commanded to stream and routinely take 10-30s to wake and deliver the first
+  frame. The stream monitor MUST NOT declare such streams stale during this
+  window (`WarmUpStaleThreshold` = 40s for sessions that never produced a
+  frame, vs 8s for established feeds) or it churn-restarts the P2P session in
+  a loop and the camera never finishes waking - the web app then never shows
+  video.
+- These cameras stream H.265 (`frame streamType=1`). Browsers cannot decode
+  HEVC via MSE, so the web player uses the `/api/raw/{SN}` endpoint (framed
+  Annex-B AUs) with the vendored hevc.js WASM decoder rendering to a canvas —
+  works in every browser, no transcode step and no ffmpeg anywhere.
+- Rapid successive stream requests can put battery cameras in a temporary
+  refuse state: if a camera stops responding to stream requests, stop the
+  stream, wait ~60s, and re-request.
+
+## Sequence Gap Handling (CRITICAL — verified against live logs)
+
+Video packets are sequenced per dataType. The station runs a go-back-N
+retransmit: whenever a packet's per-packet ACK is missing (packet lost OR the
+ACK itself lost), it re-bursts its whole un-ACKed window. That means:
+
+- **Duplicates are normal and healthy.** A re-burst delivers 10+ consecutive
+  duplicates of already-received packets while the ONE genuinely missing
+  packet is still in flight. Measured on the relayed path: the retransmit of
+  the missing seq arrives up to ~2.7s (81 packets) after the gap opened.
+- **NEVER skip a gap on duplicate streaks.** Skipping forward discards the
+  in-flight retransmit when it lands (observed in logs: resync skipped seq N,
+  then `dropping duplicate video packet seq=N` arrived 81 packets later).
+  Every skip manufactures a permanent hole: the AU reassembles with missing
+  bytes, the HEVC reference chain breaks ("Could not find ref with POC"),
+  and the picture decodes as gray skip-blocks with only motion fragments
+  visible until the next keyframe. THIS WAS THE ROOT CAUSE of the months-long
+  "95% gray" H.265 playback bug.
+- **Hold gaps open** (`videoResyncThreshold = 4s`, > measured retransmit
+  latency): packets ahead of the gap are queued; when the retransmit arrives,
+  the queue drains strictly in order and the frame reassembles intact. The
+  cost of a real loss is a brief freeze, not corruption.
+- **ACK every received packet** (`handleDataMessage` ACKs before seq
+  handling, including duplicates) — that is what slides the station's
+  retransmit window and stops the re-bursts.
+- Only after the 4s hold expires with no fill (true loss): resync to the
+  LOWEST QUEUED packet (`resyncVideoQueue`), reset frame reassembly, and let
+  the keyframe-gated serve heal the decode chain. NEVER move
+  `expectedSeqNo` backward.
+
+The protocol's full-featured transport layer implements this same contract
+via NACK/SACK control packets (uTP pt=2, RTCP-style PID+BLP chunks, u64 BE
+una_seq), retransmit history, FEC, and drop-until-keyframe recovery. Our Go
+client speaks the legacy protocol, where the equivalent feedback is per-packet
+ACKs + the station's go-back-N — the rules above are how to be a well-behaved
+legacy receiver.
+
 ## ACK Handling
 
 ACK messages (msgType 0xf1d1) payload:

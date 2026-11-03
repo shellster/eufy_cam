@@ -23,7 +23,7 @@ type VideoFrameMetadata struct {
 	VideoFPS        uint16
 	VideoWidth      uint16
 	VideoHeight     uint16
-	VideoTimestamp   uint64
+	VideoTimestamp  uint64
 	AESKey          string
 }
 
@@ -116,81 +116,71 @@ func decryptAESDataECB(hexKey string, data []byte) []byte {
 	return decrypted
 }
 
+// GetVideoCodec sniffs the codec of a raw video frame by scanning its NAL
+// unit headers. Cameras emit Annex-B framed NALs; H.264 uses 1-byte NAL
+// headers while H.265/HEVC uses 2-byte headers. The two are distinguished by
+// the NAL types found:
+//
+//	H.264: 1 (non-IDR), 5 (IDR), 7 (SPS), 8 (PPS), 9 (AUD)
+//	H.265: 32 (VPS), 33 (SPS), 34 (PPS), 35 (AUD), 19/20 (IDR), 21 (CRA)
+//
+// Newer eufy cameras (SoloCam S340/E42, Indoor Pan&Tilt, dual-lens doorbells)
+// default to H.265, whose leading VPS NAL (start code + 0x40 0x01) was
+// previously undetectable, causing HEVC streams to be muxed into
+// H.264-declared MPEG-TS and rendering as unplayable.
 func GetVideoCodec(data []byte) VideoCodec {
-	if len(data) < 5 {
-		return VideoCodecUnknown
-	}
+	foundH264 := false
+	foundH265 := false
 
-	h264StartCodes := []byte{0x67, 0x41, 0x49, 0x26, 0x01}
-	h265StartCodes := []byte{0x26, 0x02, 0x38, 0x64, 0x65}
-
-	// Check for H.264 start codes at position 3-4
-	isH264 := false
-	for _, code := range h264StartCodes {
-		if len(data) > 4 && data[3] == code {
-			isH264 = true
+	for i := 0; i+4 < len(data); {
+		// Locate a start code (3-byte 00 00 01 or 4-byte 00 00 00 01).
+		if data[i] != 0x00 || data[i+1] != 0x00 {
+			i++
+			continue
+		}
+		var nalStart int
+		if data[i+2] == 0x01 {
+			nalStart = i + 3
+		} else if data[i+2] == 0x00 && i+4 < len(data) && data[i+3] == 0x01 {
+			nalStart = i + 4
+		} else {
+			i++
+			continue
+		}
+		if nalStart+1 >= len(data) {
 			break
 		}
-	}
 
-	if isH264 {
-		return VideoCodecH264
-	}
-
-	// Check for H.265 start codes
-	for _, code := range h265StartCodes {
-		if len(data) > 4 && data[3] == code {
-			return VideoCodecH265
+		b0 := data[nalStart]
+		if b0&0x80 == 0 { // forbidden_zero_bit must be 0 on a valid NAL
+			// H.264: 1-byte header, nal type = b0 & 0x1F
+			switch b0 & 0x1F {
+			case 1, 5, 7, 8, 9:
+				foundH264 = true
+			}
+			// H.265: 2-byte header, nal type = (b0 >> 1) & 0x3F
+			switch (b0 >> 1) & 0x3F {
+			case 32, 33, 34, 35, 19, 20, 21:
+				foundH265 = true
+			}
 		}
-	}
 
-	// Check deeper in data for NAL unit type header
-	if len(data) >= 5 {
-		nalType := data[4]
-		if nalType == 0x67 || nalType == 0x41 || nalType == 0x49 || nalType == 0x26 {
+		if foundH264 && !foundH265 {
 			return VideoCodecH264
 		}
-		if nalType == 0x26 && len(data) > 5 && (data[5] == 0x02 || data[5] == 0x01) {
+		if foundH265 && !foundH264 {
 			return VideoCodecH265
 		}
+
+		// Skip past this NAL header and keep scanning.
+		i = nalStart + 2
 	}
 
+	if foundH264 {
+		return VideoCodecH264
+	}
+	if foundH265 {
+		return VideoCodecH265
+	}
 	return VideoCodecUnknown
-}
-
-func IsIFrame(data []byte, isKeyFrame bool) bool {
-	// If the metadata says it's a keyframe, trust it
-	if isKeyFrame {
-		return true
-	}
-	if len(data) < 5 {
-		return false
-	}
-
-	nalType := data[4]
-
-	// H.264 I-frame indicators (NAL type 5 or keyframe indicator)
-	if nalType == 0x05 || nalType == 0x67 || nalType == 0x68 {
-		return true
-	}
-
-	// Check for NAL unit header with keyframe flag
-	if len(data) >= 5 && data[4] == 0x01 {
-		// Look for reference picture ID field in NAL unit header
-		if data[0] == 0x67 || data[0] == 0x41 || data[0] == 0x49 {
-			// H.264 SPS or PPS, check for IDR
-			return true
-		}
-	}
-
-	return false
-}
-
-func FindStartCode(data []byte) int {
-	for i := 0; i < len(data)-3; i++ {
-		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
-			return i
-		}
-	}
-	return -1
 }

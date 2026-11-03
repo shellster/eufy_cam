@@ -2,6 +2,7 @@ package stream
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,7 +20,6 @@ type StreamSession struct {
 	Station         string
 	Channel         int
 	Codec           int
-	IsMuxed         bool
 	FrameBuffer     []TimedFrame
 	frameIDs        []int
 	NextFrameID     int
@@ -27,7 +27,6 @@ type StreamSession struct {
 	StartedAt       int64
 	LastUpdate      int64
 	mu              sync.Mutex
-	RestartMu       sync.Mutex
 
 	// PTS rebasing: camera timestamps reset or jump whenever the P2P stream
 	// restarts. These fields force a strictly monotonic, session-relative PTS
@@ -42,23 +41,35 @@ type StreamSession struct {
 	// seenValidFrame gates enforcement so an unproven camera format is served
 	// through (legacy behavior) instead of blackholing.
 	badFrames       int
-	totalBadFrames  int64
-	droppedFrames   int64
 	seenValidFrame  bool
+	everHadFrame    bool
 	awaitKeyframe   bool
-	noKeyFrameSince int64
 	lastRestartAt   int64
 }
 
 var (
 	streamIDCounter int64
-	activeStreams   = make(map[string]*StreamSession)
-	streamsMutex    sync.RWMutex
+	// activeStreams is keyed by "deviceSN#channel" (one session per
+	// device channel).
+	activeStreams = make(map[string]*StreamSession)
+	streamsMutex  sync.RWMutex
 )
+
+// streamKey builds the session map key for a device channel.
+func streamKey(deviceSN string, channel int) string {
+	return fmt.Sprintf("%s#%d", deviceSN, channel)
+}
 
 func StartStream(deviceSN, stationSN string, channel, codec int) *StreamSession {
 	streamsMutex.Lock()
 	defer streamsMutex.Unlock()
+
+	key := streamKey(deviceSN, channel)
+	if existing, ok := activeStreams[key]; ok && !existing.isStaleLocked() {
+		// Reuse the live session instead of replacing it (a second viewer
+		// must not reset the frame buffer mid-GOP).
+		return existing
+	}
 
 	session := &StreamSession{
 		ID:              atomic.AddInt64(&streamIDCounter, 1),
@@ -71,23 +82,23 @@ func StartStream(deviceSN, stationSN string, channel, codec int) *StreamSession 
 		LastUpdate:      time.Now().UnixMilli(),
 		lastKeyFrameIdx: -1,
 		awaitKeyframe:   true,
-		noKeyFrameSince: time.Now().UnixMilli(),
 	}
 
-	activeStreams[deviceSN] = session
+	activeStreams[key] = session
 	return session
 }
 
-func StopStream(deviceSN string) error {
+func StopStream(deviceSN string, channel int) error {
 	streamsMutex.Lock()
 	defer streamsMutex.Unlock()
 
-	session, ok := activeStreams[deviceSN]
+	key := streamKey(deviceSN, channel)
+	session, ok := activeStreams[key]
 	if !ok {
-		return fmt.Errorf("stream not found for device %s", deviceSN)
+		return fmt.Errorf("stream not found for %s", key)
 	}
 
-	delete(activeStreams, deviceSN)
+	delete(activeStreams, key)
 
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -98,44 +109,59 @@ func StopStream(deviceSN string) error {
 
 // StopStreamIfID stops the stream only if its ID matches, preventing
 // a stale cleanup from killing a newly started stream.
-func StopStreamIfID(deviceSN string, id int64) bool {
+func StopStreamIfID(deviceSN string, channel int, id int64) bool {
 	streamsMutex.Lock()
 	defer streamsMutex.Unlock()
 
-	session, ok := activeStreams[deviceSN]
+	key := streamKey(deviceSN, channel)
+	session, ok := activeStreams[key]
 	if !ok || session.ID != id {
 		return false
 	}
 
-	delete(activeStreams, deviceSN)
+	delete(activeStreams, key)
+
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.FrameBuffer = nil
 	return true
 }
 
-func GetStream(deviceSN string) *StreamSession {
-	streamsMutex.RLock()
-	defer streamsMutex.RUnlock()
-	return activeStreams[deviceSN]
-}
-
-func GetAllStreams() []*StreamSession {
+// GetStream returns the session for a device channel. Use -1 to look up
+// whichever session exists for the device.
+func GetStream(deviceSN string, channel int) *StreamSession {
 	streamsMutex.RLock()
 	defer streamsMutex.RUnlock()
 
-	streams := make([]*StreamSession, 0, len(activeStreams))
-	for _, s := range activeStreams {
-		streams = append(streams, s)
+	if session, ok := activeStreams[streamKey(deviceSN, channel)]; ok {
+		return session
 	}
-	return streams
+	if channel < 0 {
+		// Legacy/ambiguous lookup: return any session for this device.
+		prefix := deviceSN + "#"
+		for k, s := range activeStreams {
+			if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+				return s
+			}
+		}
+	}
+	return nil
 }
 
-func StopAll() {
-	streamsMutex.Lock()
-	defer streamsMutex.Unlock()
+// StreamChannelsForDevice returns the channels that currently have live
+// sessions for a device.
+func StreamChannelsForDevice(deviceSN string) []int {
+	streamsMutex.RLock()
+	defer streamsMutex.RUnlock()
 
-	for deviceSN := range activeStreams {
-		delete(activeStreams, deviceSN)
+	prefix := deviceSN + "#"
+	var channels []int
+	for k, s := range activeStreams {
+		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+			channels = append(channels, s.Channel)
+		}
 	}
+	sort.Ints(channels)
+	return channels
 }
+

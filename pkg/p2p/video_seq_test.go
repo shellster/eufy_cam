@@ -46,11 +46,11 @@ func wrapWithInnerHeader(video []byte, totalLen int, channel byte) []byte {
 
 type frameCollector struct {
 	mu     sync.Mutex
-	frames []int          // payload lengths
-	ts     []uint64       // video timestamps
+	frames []int    // payload lengths
+	ts     []uint64 // video timestamps
 }
 
-func (fc *frameCollector) cb(deviceSN string, frameData []byte, metadata VideoFrameMetadata) error {
+func (fc *frameCollector) cb(deviceSN string, channel byte, frameData []byte, metadata VideoFrameMetadata) error {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	fc.frames = append(fc.frames, len(frameData))
@@ -210,9 +210,9 @@ func TestVideoSeqGapFastResync(t *testing.T) {
 		t.Fatalf("got %d frames, want 1", fc.count())
 	}
 
-	// Simulate a gap that has already exceeded the resync threshold
-	// (packet 101..103 lost in transit).
-	c.lastVideoPacketTime = time.Now().Add(-time.Second)
+	// Simulate a real loss: the gap has already exceeded the 4s hold
+	// (packet 101..103 lost in transit and never retransmitted).
+	c.lastVideoPacketTime = time.Now().Add(-5 * time.Second)
 	c.handleVideoMessage(1, 104, wrapWithInnerHeader(buildVideoData(false, 1200, testAnnexB), 22+len(testAnnexB), 0))
 	if fc.count() != 2 {
 		t.Fatalf("gap should trigger fast resync: got %d frames, want 2", fc.count())

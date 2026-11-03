@@ -11,24 +11,25 @@ import (
 	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
+	staticpkg "github.com/shellster/eufy_cam"
 	"github.com/shellster/eufy_cam/config"
 	"github.com/shellster/eufy_cam/pkg/api"
 	"github.com/shellster/eufy_cam/pkg/devices"
 	debuglog "github.com/shellster/eufy_cam/pkg/log"
 	"github.com/shellster/eufy_cam/pkg/web"
-	staticpkg "github.com/shellster/eufy_cam"
 )
 
 var (
-	cfg             *config.Config
-	apiClient       *api.Client
-	webServer       *web.Server
-	httpServer      *http.Server
-	streamServer    *http.Server
+	cfg          *config.Config
+	apiClient    *api.Client
+	webServer    *web.Server
+	httpServer   *http.Server
+	streamServer *http.Server
 )
 
 func main() {
@@ -89,6 +90,9 @@ func main() {
 
 	// Attempt initial login in background
 	go attemptLogin(ctx)
+
+	// Keep station control channels alive (reconnects dead P2P sessions)
+	go superviseStations(ctx)
 
 	// Wait for shutdown
 	<-ctx.Done()
@@ -165,7 +169,7 @@ func connectStations(ctx context.Context) error {
 
 	allStations := devices.GetAllStations()
 	var wg sync.WaitGroup
-	connectedCount := 0
+	var connectedCount atomic.Int32
 
 	for _, station := range allStations {
 		wg.Add(1)
@@ -188,7 +192,7 @@ func connectStations(ctx context.Context) error {
 			}
 
 			log.Printf("Connected to station %s", s.GetSerial())
-			connectedCount++
+			connectedCount.Add(1)
 		}(station)
 	}
 
@@ -198,11 +202,52 @@ func connectStations(ctx context.Context) error {
 
 	wg.Wait()
 
-	if connectedCount > 0 {
-		log.Printf("Successfully connected to %d/%d stations", connectedCount, len(allStations))
+	if n := connectedCount.Load(); n > 0 {
+		log.Printf("Successfully connected to %d/%d stations", n, len(allStations))
 	}
 
 	return nil
+}
+
+// superviseStations periodically re-establishes primary P2P connections that
+// have died (station reboot, END received, NAT timeout). Livestream recovery
+// is handled separately by the per-stream monitor; this keeps the station
+// control channel itself alive.
+func superviseStations(ctx context.Context) {
+	const interval = 15 * time.Second
+	const retryCooldown = 45 * time.Second
+
+	lastAttempt := make(map[string]time.Time)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, st := range devices.GetAllStations() {
+				if ctx.Err() != nil {
+					return
+				}
+				if st.MainConnected() {
+					continue
+				}
+				sn := st.GetSerial()
+				if time.Since(lastAttempt[sn]) < retryCooldown {
+					continue
+				}
+				lastAttempt[sn] = time.Now()
+
+				log.Printf("Station %s: main P2P connection is down, reconnecting...", sn)
+				if err := st.ReconnectMain("", apiClient); err != nil {
+					log.Printf("Station %s: reconnect failed: %v (will retry)", sn, err)
+				} else {
+					log.Printf("Station %s: main P2P connection re-established", sn)
+				}
+			}
+		}
+	}
 }
 
 func startWebServer(ctx context.Context) {

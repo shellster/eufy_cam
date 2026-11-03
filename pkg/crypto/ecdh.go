@@ -8,6 +8,8 @@ import (
 )
 
 const (
+	// ServerPublicKey is the eufy cloud's P-256 public key used to verify
+	// API responses.
 	ServerPublicKey = "04c5c00c4f8d1197cc7c3167c52bf7acb054d722f0ef08dcd7e0883236e0d72a3868d9750cb47fa4619248f3d83f0f662671dadc6e2d31c2f41db0161651c7c076"
 )
 
@@ -63,11 +65,3 @@ func ComputeSecret(privateKeyHex, publicKeyHex string) ([]byte, error) {
 	return secret, nil
 }
 
-func ParseServerPublicKey() (*ecdh.PublicKey, error) {
-	publicKeyBytes, err := hex.DecodeString(ServerPublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode server public key: %w", err)
-	}
-
-	return ecdh.P256().NewPublicKey(publicKeyBytes)
-}

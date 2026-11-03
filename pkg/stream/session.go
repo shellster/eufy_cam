@@ -9,22 +9,29 @@ import (
 	"github.com/shellster/eufy_cam/pkg/p2p"
 )
 
-const maxFrames = 100
-const maxBufferBytes = 4 * 1024 * 1024 // 4MB
+// maxFrames must span AT LEAST one full keyframe interval: late-joining
+// viewers are served from the last keyframe in the buffer, so if the buffer
+// is shorter than the camera's keyframe interval, a joining viewer never
+// receives a keyframe and can never start decoding (SoloCam S340/E42 emit
+// keyframes every ~20s = 300 frames at 15fps). 600 frames (~40s) covers it.
+const maxFrames = 600
+const maxBufferBytes = 24 * 1024 * 1024 // 24MB
 
-// StaleThreshold is how long without frames before the feed is considered
-// dead. Must comfortably exceed camera warm-up time after a restart (battery
-// cameras can take several seconds to start sending video) and normal
-// inter-frame jitter, but still recover in a reasonable time.
+// StaleThreshold is how long without frames before an ESTABLISHED feed
+// (one that has produced at least one frame) is considered dead.
 const StaleThreshold = 8 * time.Second
+
+// WarmUpStaleThreshold is how long a stream may take to produce its FIRST
+// frame. Battery/solar cameras (SoloCam S340/E42, battery doorbells) sleep
+// and must wake on demand, which routinely takes 10-30s. The old fixed 8s
+// threshold declared sleeping cameras stale and churn-restarted the P2P
+// session in a loop, so the camera never finished waking and the web app
+// never showed video.
+const WarmUpStaleThreshold = 40 * time.Second
 
 // maxPTSJumpMs bounds how far the camera timestamp may jump forward between
 // frames before it is treated as a clock change and rebased.
 const maxPTSJumpMs = 10000
-
-// noKeyFrameFallback is how long clients wait for a keyframe after a stream
-// (re)start before falling back to serving mid-GOP frames.
-const noKeyFrameFallback = 3 * time.Second
 
 // badFrameRestartThreshold is the number of consecutively invalid frames that
 // triggers a P2P livestream restart.
@@ -34,6 +41,45 @@ const badFrameRestartThreshold = 60
 const restartCooldown = 5 * time.Second
 
 var annexBStartCode = []byte{0x00, 0x00, 0x01}
+
+// isKeyframeBitstream reports whether frameData contains an IDR/CRA NAL.
+// codec: 1=H.264, 2=H.265. The AU often leads with VPS/SPS/PPS/SEI before
+// the actual IDR slice, so walk every NAL — checking only the first one
+// misses every keyframe on cameras that prepend parameter sets.
+func isKeyframeBitstream(data []byte, codec int) bool {
+	idx := 0
+	for idx+4 <= len(data) {
+		sc := bytes.Index(data[idx:], annexBStartCode)
+		if sc < 0 {
+			return false
+		}
+		idx += sc + len(annexBStartCode)
+		if idx >= len(data) {
+			return false
+		}
+		b0 := data[idx]
+		switch codec {
+		case 2: // HEVC: 2-byte NAL header, type = (b0>>1)&0x3F
+			t := int(b0>>1) & 0x3F
+			if t == 19 || t == 20 || t == 21 { // IDR_W_RADL, IDR_N_LP, CRA
+				return true
+			}
+		case 1: // H.264: 1-byte NAL header, type = b0&0x1F
+			if b0&0x1F == 5 { // IDR
+				return true
+			}
+		default:
+			t := int(b0>>1) & 0x3F
+			if t == 19 || t == 20 || t == 21 {
+				return true
+			}
+			if b0&0x1F == 5 {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func (s *StreamSession) IsStale() bool {
 	s.mu.Lock()
@@ -45,13 +91,44 @@ func (s *StreamSession) isStaleLocked() bool {
 	if s.LastUpdate == 0 {
 		return false
 	}
-	return time.Since(time.UnixMilli(s.LastUpdate)) > StaleThreshold
+	elapsed := time.Since(time.UnixMilli(s.LastUpdate))
+	// A camera that has never produced a frame may still be waking up
+	// (battery/solar models sleep until commanded). Give it the full
+	// warm-up budget before declaring it dead.
+	if !s.everHadFrame {
+		return elapsed > WarmUpStaleThreshold
+	}
+	return elapsed > StaleThreshold
 }
 
 func (s *StreamSession) ResetLastUpdate() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.LastUpdate = time.Now().UnixMilli()
+}
+
+// CurrentCodec returns the detected codec under lock. Codec is written by
+// AppendFrame, so readers must not access the field directly.
+func (s *StreamSession) CurrentCodec() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Codec
+}
+
+// LastKeyFrameIdx exposes the last keyframe position for serve-path
+// diagnostics.
+func (s *StreamSession) LastKeyFrameIdx() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastKeyFrameIdx
+}
+
+// AwaitKeyframe reports whether the session is still waiting for its first
+// keyframe to serve.
+func (s *StreamSession) AwaitKeyframe() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.awaitKeyframe && s.lastKeyFrameIdx < 0
 }
 
 // NeedsRestart reports whether the upstream feed is dead (stale) or producing
@@ -105,6 +182,7 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 	defer s.mu.Unlock()
 
 	s.LastUpdate = time.Now().UnixMilli()
+	s.everHadFrame = true
 
 	// Validate the bitstream before buffering: once this camera has been
 	// PROVEN to emit Annex-B frames (one valid frame seen), subsequent frames
@@ -114,14 +192,11 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 	hasStartCode := len(frameData) > 0 && bytes.Contains(frameData, annexBStartCode)
 	if s.seenValidFrame && !hasStartCode {
 		s.badFrames++
-		s.totalBadFrames++
-		s.droppedFrames++
-		debuglog.Debugf("StreamSession: %s dropped invalid frame #%d (badRun=%d, totalBad=%d, %d bytes)",
-			s.DeviceSN, s.NextFrameID+1, s.badFrames, s.totalBadFrames, len(frameData))
+		debuglog.Debugf("StreamSession: %s dropped invalid frame #%d (badRun=%d, %d bytes)",
+			s.DeviceSN, s.NextFrameID+1, s.badFrames, len(frameData))
 		return
 	}
 	if len(frameData) == 0 {
-		s.droppedFrames++
 		return
 	}
 	s.badFrames = 0
@@ -130,34 +205,47 @@ func (s *StreamSession) AppendFrame(frameData []byte, metadata p2p.VideoFrameMet
 	}
 
 	if s.Codec == 0 {
-		detected := p2p.GetVideoCodec(frameData)
-		if detected == p2p.VideoCodecH265 {
-			s.Codec = 2
-		} else if detected == p2p.VideoCodecH264 {
+		// The camera reports its codec directly in the frame header
+		// (0=H.264, 1=H.265). Older code assumed StreamType==2 meant H.265
+		// (the CMD_SET_PAYLOAD numbering) — that check never matched the
+		// frame-header values, so H.265 cameras (SoloCam S340/E42 and other
+		// pan-tilt models) fell through to H.264 and produced unplayable TS.
+		switch metadata.StreamType {
+		case 0:
 			s.Codec = 1
-		} else if metadata.StreamType == 2 {
+		case 1:
 			s.Codec = 2
+		default:
+			if detected := p2p.GetVideoCodec(frameData); detected == p2p.VideoCodecH265 {
+				s.Codec = 2
+			} else if detected == p2p.VideoCodecH264 {
+				s.Codec = 1
+			}
 		}
 		if s.Codec != 0 {
-			debuglog.Debugf("StreamSession: detected codec %d for %s", s.Codec, s.DeviceSN)
+			debuglog.Debugf("StreamSession: detected codec %d for %s (frame streamType=%d)", s.Codec, s.DeviceSN, metadata.StreamType)
 		}
 	}
 
 	pts := s.rebasePTS(metadata)
 
+	// Some cameras (SoloCam E42 pan-tilt family) never set the isKeyFrame
+	// flag in the eufy video header, even for real IDR frames. Trust the
+	// BITSTREAM instead: an IDR/CRA NAL at the head of the AU is a keyframe
+	// regardless of what the header claims.
+	isKey := metadata.IsKeyFrame || isKeyframeBitstream(frameData, s.Codec)
+
 	s.NextFrameID++
 	s.FrameBuffer = append(s.FrameBuffer, TimedFrame{
 		Data:       frameData,
 		PTS:        pts,
-		IsKeyFrame: metadata.IsKeyFrame,
+		IsKeyFrame: isKey,
 	})
 	s.frameIDs = append(s.frameIDs, s.NextFrameID)
 
-	if metadata.IsKeyFrame {
+	if isKey {
 		s.lastKeyFrameIdx = len(s.FrameBuffer) - 1
 		s.awaitKeyframe = false
-	} else if s.lastKeyFrameIdx < 0 && s.noKeyFrameSince == 0 {
-		s.noKeyFrameSince = time.Now().UnixMilli()
 	}
 
 	// Drop oldest frames if buffer exceeds size limit
@@ -223,10 +311,9 @@ func (s *StreamSession) rebasePTS(metadata p2p.VideoFrameMetadata) uint64 {
 
 // GetFramesSince returns all frames after sinceID. If sinceID is before the
 // last keyframe, frames start from the keyframe so the client can resync.
-// Returns the frames and the nextID to pass on the next call.
-// After a stream (re)start, no frames are served until a keyframe arrives (or
-// the noKeyFrameFallback timeout expires) so clients never receive undecodable
-// mid-GOP data from a fresh encoder session.
+// Returns the frames and the nextID to pass on the next call. After a stream
+// (re)start, no frames are served until a keyframe arrives so clients never
+// receive undecodable mid-GOP data from a fresh encoder session.
 func (s *StreamSession) GetFramesSince(sinceID int) ([]TimedFrame, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,12 +322,14 @@ func (s *StreamSession) GetFramesSince(sinceID int) ([]TimedFrame, int) {
 		return nil, sinceID
 	}
 
+	// A client that joins mid-GOP receives P-frames referencing frames it
+	// never saw: the decoder renders gray skip-blocks with only motion
+	// fragments visible. NEVER fall back to mid-GOP serving — hold frames
+	// until the first keyframe arrives (the camera emits one every ~16-20s,
+	// well inside the player's 45s wake budget). The session stale monitor
+	// covers the camera-dead case, so waiting here cannot hang forever.
 	if s.lastKeyFrameIdx < 0 {
-		// No keyframe in the buffer yet. Wait for one so every client starts
-		// at a decodable point, but do not wait forever.
-		if s.noKeyFrameSince == 0 || time.Since(time.UnixMilli(s.noKeyFrameSince)) < noKeyFrameFallback {
-			return nil, sinceID
-		}
+		return nil, sinceID
 	}
 
 	// Find where to start reading
@@ -275,14 +364,6 @@ func (s *StreamSession) ClearBuffer() {
 	// The next frames come from a fresh encoder session: wait for a keyframe
 	// before serving anything.
 	s.awaitKeyframe = true
-	s.noKeyFrameSince = time.Now().UnixMilli()
-}
-
-func (s *StreamSession) IsActive() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.LastUpdate > 0
 }
 
 func (s *StreamSession) FrameCount() int {

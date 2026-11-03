@@ -79,17 +79,37 @@ port = 8090
 bind = "0.0.0.0"
 ```
 
-Then connect directly:
+Then connect directly — the URL is just the camera's device SN, no parameters:
 
 ```bash
-# Stream a camera
+# Play a camera
 ffplay http://localhost:8090/T8134P2024342790
 
-# Use in frigate
-ffmpeg -i http://localhost:8090/T8134P2024342790 ...
+# Record 60 seconds without re-encoding
+ffmpeg -i http://localhost:8090/T8134P2024342790 -c copy -t 60 out.mp4
+
+# Use in frigate / other NVRs
+ffmpeg -i http://localhost:8090/<deviceSN> ...
 ```
 
-Multiple clients can connect to the same camera URL. When the last client disconnects, the P2P stream is torn down after 30 seconds.
+Both H.264 and H.265 cameras work — the stream is standard MPEG-TS and
+ffmpeg/ffplay/VLC decode HEVC natively (the browser HEVC limitation does not
+apply here). Multiple clients can connect to the same camera URL; when the
+last one disconnects, the P2P stream is torn down after 30 seconds.
+
+**First connect can be slow — two things to know:**
+
+1. **Login/captcha must complete first.** Until the server has logged into
+   the Eufy cloud, stream URLs will fail. Eufy frequently demands a captcha
+   on fresh login: open `http://localhost:8080/login` in a browser once
+   after startup and solve it. The server maintains the session on its own
+   after that.
+2. **Battery/solar cameras sleep.** eufyCam, SoloCam, and doorbell models
+   take 10-40 seconds after the first connect to wake and deliver the first
+   frame — ffmpeg/ffplay will sit on an empty stream during wake-up. That is
+   normal; wait it out. Do NOT disconnect/reconnect rapidly to "fix" the
+   delay: rapid start/stop cycles can put these cameras in a temporary
+   refuse state for about a minute.
 
 
 **CLI:**

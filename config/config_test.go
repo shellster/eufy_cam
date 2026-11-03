@@ -19,7 +19,6 @@ func writeTestConfig(t *testing.T, content string) string {
 
 func TestDefaultTimeouts(t *testing.T) {
 	path := writeTestConfig(t, `[p2p]
-local_port = 0
 connection_type = 2
 `)
 
@@ -44,7 +43,6 @@ connection_type = 2
 
 func TestCustomTimeouts(t *testing.T) {
 	path := writeTestConfig(t, `[p2p]
-local_port = 0
 connection_type = 2
 connection_timeout = 120
 encryption_timeout = 60

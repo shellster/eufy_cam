@@ -17,26 +17,27 @@ import (
 	"time"
 
 	"github.com/shellster/eufy_cam/pkg/api"
+	"github.com/shellster/eufy_cam/pkg/crypto"
 	debuglog "github.com/shellster/eufy_cam/pkg/log"
 )
 
 const (
-	DefaultPort          = 32108
-	MaxRetries           = 10
-	MaxConnectionTimeout = 25 * time.Second
-	MaxAckTimeout        = 5 * time.Second
-	MaxLookupTimeout     = 20 * time.Second
-	HeartbeatInterval    = 3 * time.Second
-	KeepaliveInterval    = 2 * time.Second
-	MaxStreamDataWait    = 5 * time.Second
-	MaxSequenceNumber    = 65535
-	SequenceBoundary     = 20000
+	DefaultPort       = 32108
+	MaxSequenceNumber = 65535
+	HeartbeatInterval = 3 * time.Second
 
-	// videoResyncThreshold is how long a sequence gap is tolerated (waiting for
-	// reordered packets to arrive) before we declare packet loss and resync.
-	// Must be long enough to absorb UDP reordering, short enough that a loss
-	// event is only a brief hiccup instead of a multi-second stall.
-	videoResyncThreshold = 250 * time.Millisecond
+	// videoResyncThreshold is how long a sequence gap is held open while
+	// waiting for the station's go-back-N retransmit to fill it. Measured on
+	// the relayed path: the station retransmits a lost packet up to ~2.7s
+	// after the gap opened (81 packets later), and it keeps re-bursting the
+	// un-ACKed window until the per-packet ACK arrives — both sides already
+	// speak that contract (every received packet is ACKed, including
+	// duplicates). Skipping a gap early converts a recoverable delay into a
+	// permanent hole: the frame reassembles with missing bytes, the decoder's
+	// reference chain breaks, and the picture goes gray until the next
+	// keyframe. So hold the gap far longer than the retransmit latency; the
+	// cost of a real loss is a brief freeze instead of corruption.
+	videoResyncThreshold = 4 * time.Second
 	// maxQueuedVideoPackets caps the out-of-order video queue so memory and
 	// recovery time stay bounded no matter what the station sends.
 	maxQueuedVideoPackets = 1024
@@ -112,7 +113,7 @@ type Client struct {
 	mu     sync.Mutex
 }
 
-type StreamCallback func(deviceSN string, frameData []byte, metadata VideoFrameMetadata) error
+type StreamCallback func(deviceSN string, channel byte, frameData []byte, metadata VideoFrameMetadata) error
 
 type videoRoute struct {
 	deviceSN string
@@ -220,6 +221,18 @@ func (c *Client) Connect() error {
 	if err != nil {
 		c.connecting = false
 		return fmt.Errorf("failed to listen UDP: %w", err)
+	}
+
+	// Eufy cameras emit keyframes as a single back-to-back UDP burst
+	// (~290KB for a 1440p keyframe). The default kernel receive buffer
+	// (~212KB) is smaller than one burst, so the tail of every keyframe was
+	// being dropped by the kernel before this process ever read it — the
+	// direct cause of broken/gray decodes on these cameras. 4MB comfortably
+	// holds a full keyframe burst plus normal inter-frame traffic. This is a
+	// per-socket option set in userspace (SO_RCVBUF via the Go net API) —
+	// no system configuration is touched.
+	if err := conn.SetReadBuffer(4 * 1024 * 1024); err != nil {
+		debuglog.Debugf("P2P: SetReadBuffer failed (non-fatal): %v", err)
 	}
 
 	c.conn = conn
@@ -822,7 +835,14 @@ func (c *Client) handleVideoMessage(dtIdx int, seqNo uint16, data []byte) {
 	}
 
 	if isSeqBefore(seqNo, expected) {
-		// Duplicate or very late packet: already processed, drop it.
+		// Duplicate or very late packet: already processed (or queued), drop
+		// it. Its ACK already went out in handleDataMessage — that is what
+		// slides the station's go-back-N window and stops the re-burst. Do
+		// NOT treat duplicates as evidence that `expected` is lost: a go-back-N
+		// re-burst delivers 10+ consecutive duplicates of already-delivered
+		// packets while the ONE genuinely missing packet is still in flight
+		// (observed arriving ~2.7s later). Skipping forward here discards
+		// that retransmit and manufactures the very hole it was meant to heal.
 		debuglog.Debugf("P2P: dropping duplicate video packet seq=%d expected=%d", seqNo, expected)
 		return
 	}
@@ -1195,7 +1215,7 @@ func (c *Client) handleVideoData(seqNo uint16, header P2PDataHeader, data []byte
 			metadata.VideoWidth, metadata.VideoHeight, len(frameData), header.signCode)
 
 		if cb != nil {
-			if err := cb(deviceSN, frameData, metadata); err != nil {
+			if err := cb(deviceSN, header.channel, frameData, metadata); err != nil {
 				debuglog.Debugf("P2P: video callback error: %v", err)
 			}
 		}
@@ -1216,7 +1236,11 @@ func (c *Client) handleCommandData(seqNo uint16, header P2PDataHeader, data []by
 		c.mu.Unlock()
 
 		if enc != EncryptionTypeNone && len(p2pKey) == 16 && len(data) >= aes.BlockSize {
-			decrypted := DecryptECBPayload(data, p2pKey)
+			decrypted, err := crypto.DecryptECBRaw(data, p2pKey)
+			if err != nil {
+				debuglog.Debugf("P2P: failed to decrypt command data: %v", err)
+				return
+			}
 			data = decrypted
 		}
 	}
@@ -1245,7 +1269,7 @@ func (c *Client) handleGatewayInfo(data []byte) {
 	}
 
 	cipherID := binary.LittleEndian.Uint16(data[0:2])
-	encryptedKey := readNullTerminated(data[4:])
+	encryptedKey := []byte(crypto.ReadNullTerminatedString(data[4:]))
 
 	debuglog.Debugf("P2P: GATEWAYINFO cipherID=%d encryptedKeyLen=%d", cipherID, len(encryptedKey))
 
@@ -1284,7 +1308,7 @@ func (c *Client) setupEncryptionFallback() {
 	c.encryption = EncryptionTypeLevel1
 	c.p2pKey = []byte(key)
 	c.mu.Unlock()
-	debuglog.Debugf("P2P: Encryption LEVEL_1 set, key=%s (len=%d)", key, len(key))
+	debuglog.Debugf("P2P: Encryption LEVEL_1 set (keyLen=%d)", len(key))
 	c.signalEncryptionReady()
 }
 
@@ -1298,23 +1322,8 @@ func (c *Client) signalEncryptionReady() {
 	c.sendQueuedMessage()
 }
 
-func readNullTerminated(data []byte) []byte {
-	for i, b := range data {
-		if b == 0 {
-			return data[:i]
-		}
-	}
-	return data
-}
-
 func decryptP2PKeyWithCipher(encryptedKey []byte, privateKeyPEM string) ([]byte, error) {
-	pemData := privateKeyPEM
-	// Strip newlines that may interfere
-	pemData = strings.ReplaceAll(pemData, "\n", "")
-	pemData = strings.ReplaceAll(pemData, "\r", "")
-	// Re-add proper PEM formatting
-	if !strings.Contains(pemData, "-----BEGIN") {
-		// No PEM headers at all
+	if !strings.Contains(privateKeyPEM, "-----BEGIN") {
 		return nil, fmt.Errorf("private key has no PEM headers")
 	}
 
@@ -1365,7 +1374,10 @@ func (c *Client) SendCommandWithInt(commandType CommandType, channel byte, value
 	p2pKey := c.p2pKey
 	c.mu.Unlock()
 
-	payload := BuildIntCommandPayload(int(encType), p2pKey, uint16(commandType), value, "", channel)
+	payload, err := BuildIntCommandPayload(int(encType), p2pKey, uint16(commandType), value, "", channel)
+	if err != nil {
+		return err
+	}
 	return c.SendCommand(commandType, channel, payload)
 }
 
@@ -1380,7 +1392,10 @@ func (c *Client) SendCommandWithStringPayload(commandType CommandType, channel b
 		return fmt.Errorf("no remote address")
 	}
 
-	payload := BuildCommandWithStringTypePayload(int(encType), p2pKey, uint16(commandType), value, channel)
+	payload, err := BuildCommandWithStringTypePayload(int(encType), p2pKey, uint16(commandType), value, channel)
+	if err != nil {
+		return err
+	}
 	return c.SendCommand(commandType, channel, payload)
 }
 
@@ -1506,23 +1521,6 @@ func (c *Client) SetVideoCallback(deviceSN string, channel byte, callback Stream
 		debuglog.Debugf("P2P: channel %d collision: replacing %s with %s", channel, existing.deviceSN, deviceSN)
 	}
 	c.videoRoutes[channel] = &videoRoute{deviceSN: deviceSN, callback: callback}
-}
-
-func (c *Client) ClearVideoCallback() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.videoRoutes = make(map[byte]*videoRoute)
-}
-
-func (c *Client) ClearVideoCallbackForDevice(deviceSN string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for ch, route := range c.videoRoutes {
-		if route.deviceSN == deviceSN {
-			delete(c.videoRoutes, ch)
-			delete(c.videoStates, ch)
-		}
-	}
 }
 
 func (c *Client) handleTurnServerOK(payload []byte, raddr *net.UDPAddr) {
