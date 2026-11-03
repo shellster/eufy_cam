@@ -50,8 +50,9 @@ connection_type = 2
 # password = "secret"
 
 [stream]
-# Public streaming port — serves MPEG-TS with no auth.
-# Streams auto-start on connect, teardown after last client leaves (30s grace).
+# Public streaming port — serves the same /api/stream/<deviceSN> URLs as the
+# main server, with no auth. Streams auto-start on connect, teardown after
+# the last consumer anywhere leaves (30s grace).
 # enabled = true
 # port = 8090
 # Address the stream port binds to. Default: "127.0.0.1" — the port is

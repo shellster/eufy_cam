@@ -254,51 +254,19 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
 }
 
+// RegisterStreamRoutes mounts the camera streaming endpoint on the optional
+// unauthenticated stream port. Consumers use one URL shape everywhere —
+// http://<host>:<port>/api/stream/<deviceSN> — and pick the port for its
+// auth posture (main port: digest auth if enabled; stream port: none).
+//
+// ISOLATION RULE: this port is unauthenticated, so it must expose NOTHING
+// but camera streaming. No API discovery, no camera/station lists, no login,
+// no static files — anything mounted here is reachable without credentials.
+// Anything else belongs on the main server's router (RegisterRoutes) only.
 func (s *Server) RegisterStreamRoutes(r *mux.Router) {
-	r.HandleFunc("/{deviceSN}", s.StreamPortHandler).Methods("GET")
+	r.HandleFunc("/api/stream/{deviceSN}", s.StreamHandler).Methods("GET")
 }
 
-func (s *Server) StreamPortHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	deviceSN := vars["deviceSN"]
-
-	if deviceSN == "" {
-		http.Error(w, "deviceSN required", http.StatusBadRequest)
-		return
-	}
-
-	channel, ok := resolveChannel(r, s, deviceSN)
-	if !ok {
-		http.Error(w, "device not found: "+deviceSN, http.StatusNotFound)
-		return
-	}
-
-	// streamID is shared with the serve loop: on a mid-connection session
-	// replacement the loop updates it so this expire never guards against a
-	// stale ID (a stale guard silently leaks the stream forever).
-	streamID := int64(0)
-	count := streamWatchers.add(deviceSN, channel)
-	log.Printf("Stream port: client connected to %s ch=%d (active: %d)", deviceSN, channel, count)
-	defer streamWatchers.remove(deviceSN, channel, func() {
-		s.stopExpiredStream(deviceSN, channel, &streamID)
-	})
-
-	strm := stream.GetStream(deviceSN, channel)
-	if strm == nil || strm.IsStale() {
-		if err := s.startStreamForDevice(deviceSN, channel); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		strm = stream.GetStream(deviceSN, channel)
-	}
-	if strm == nil {
-		http.Error(w, "failed to start stream", http.StatusInternalServerError)
-		return
-	}
-	streamID = strm.ID
-
-	s.serveStreamFrames(w, r, deviceSN, strm, &streamID, "Stream port")
-}
 
 // ptsRemapper maps session PTS onto a connection-relative timeline that
 // starts near zero — MSE only decodes when currentTime is inside the
@@ -895,7 +863,8 @@ func (s *Server) StreamHandler(w http.ResponseWriter, r *http.Request) {
 	// so the expire guard tracks the live session across replacements; it
 	// stays 0 if the start fails, making the expire a no-op.
 	streamID := int64(0)
-	streamWatchers.add(deviceSN, channel)
+	count := streamWatchers.add(deviceSN, channel)
+	log.Printf("Stream: client connected to %s ch=%d on %s (active: %d)", deviceSN, channel, r.Host, count)
 	defer streamWatchers.remove(deviceSN, channel, func() {
 		s.stopExpiredStream(deviceSN, channel, &streamID)
 	})

@@ -66,17 +66,19 @@ You can protect the server with digest auth if you want (see `[auth]` section of
 You can view your cameras and stream directly from the server's web UI at `http://localhost:8080` — every camera plays at a bare path like `/stream/<deviceSN>`, no parameters.
 
 For consuming streams with ffmpeg, ffplay, frigate, or similar, every
-camera is available as a static MPEG-TS URL on the main server — see
-[Streaming with ffmpeg](#streaming-with-ffmpeg). The optional
-[Public Stream Port](#public-stream-port) adds a separate unauthenticated
-port for NVR deployments where the main server runs digest auth. The CLI
-tool is a convenience for listing cameras and piping streams, and handles
-the digest-auth case for scripted consumers (see its section below).
+camera is available as a static MPEG-TS URL — see
+[Streaming with ffmpeg](#streaming-with-ffmpeg). Without digest auth (the
+default) the main server serves ffmpeg directly. With digest auth enabled,
+scripted consumers should use the optional
+[Stream Port](#stream-port) (same URL, separate
+unauthenticated port) or the [CLI](#cli-convenience-tool), which carries
+the credentials.
 
 ## Streaming with ffmpeg
 
-Every camera is a static MPEG-TS URL on the main server — the URL is just
-the camera's device SN, no parameters:
+Every camera is a static MPEG-TS URL — `/api/stream/` plus the camera's
+device SN, no parameters. Without digest auth (the default) the main
+server serves these directly:
 
 ```bash
 # Play a camera
@@ -88,6 +90,12 @@ ffmpeg -i http://localhost:8080/api/stream/T8134P2024342790 -c copy -t 60 out.mp
 # Use in frigate / other NVRs
 ffmpeg -i http://localhost:8080/api/stream/<deviceSN> ...
 ```
+
+**With digest auth enabled** the main port challenges every request —
+fine for the web UI (browsers prompt), hostile for ffmpeg. In that setup
+either enable the [Stream Port](#stream-port) (identical
+URLs, no auth, bind it to loopback or your NVR's interface) or use the
+[CLI](#cli-convenience-tool), which handles the credentials.
 
 The stream auto-starts on connect (waking battery cameras as needed) and
 stops ~30 seconds after the last consumer of that camera disconnects —
@@ -110,28 +118,31 @@ Multiple simultaneous consumers of the same camera share one P2P session.
    delay: rapid start/stop cycles can put these cameras in a temporary
    refuse state for about a minute.
 
-### Public Stream Port
+### Stream Port
 
-An OPTIONAL second port serving the same MPEG-TS streams with **no
-authentication**. This exists for NVR-style deployments: run digest auth on
-the main port for the web UI, and expose only the stream port to your
-recorder. It binds to loopback by default — set `bind` to `0.0.0.0` or a
-specific interface IP to expose it.
+An OPTIONAL second port serving the **same URLs** (`/api/stream/<deviceSN>`)
+with **no authentication**. This exists for NVR-style deployments: run
+digest auth on the main port for the web UI, and give the recorder only the
+unauthenticated stream port. It binds to loopback by default — set `bind`
+to `0.0.0.0` or a specific interface IP to expose it to your NVR.
+
+**WARNING:** This port will **ALWAYS** be unauthenticated, so do not expose it publicly unless you know what you are doing.  This is true even when you have digest auth enabled for the main port.  The whole point of this feature is to expose it privately to an NVR when you want to otherwise require Digest Auth.
 
 ```toml
 [stream]
 enabled = true
 port = 8090
-# bind = "127.0.0.1"   # default; change to expose, e.g. "0.0.0.0" or "192.168.1.10"
+# bind = "127.0.0.1"   # default
 ```
 
 ```bash
-ffplay http://localhost:8090/T8134P2024342790
+ffplay http://localhost:8090/api/stream/T8134P2024342790
 ```
 
-Consumers are counted together with the main port: the camera keeps
-streaming until the last consumer anywhere is gone for 30 seconds. Remember
-these URLs are unauthenticated — only expose the port where you intend to.
+The port exposes ONLY the `/api/stream/<deviceSN>` path — no API, no
+login, no static files, nothing else answers. Consumers are counted
+together with the main port: the camera keeps streaming until the last
+consumer anywhere is gone for 30 seconds. 
 
 
 ## CLI (convenience tool)
@@ -153,9 +164,9 @@ while running, and stops the camera cleanly on exit.
 ./eufy-cli stream T8134P2024342790 | ffmpeg -i - -c copy -t 60 out.mp4
 ```
 
-**When you don't need it:** if digest auth is disabled (the default) and the
-public stream port is enabled, point ffmpeg/ffplay directly at the stream
-port URL — see [Public Stream Port](#public-stream-port).
+**When you don't need it:** if digest auth is disabled (the default) and/or the
+stream port is enabled, point ffmpeg/ffplay directly at the stream path (either the service port if no auth or the stream port if auth)
+port URL — see [Stream Port](#stream-port).
 
 **When you do need it:** if you enable digest auth (the `[auth]` section of
 the toml), everything under the main port requires credentials. Browsers
